@@ -668,7 +668,7 @@ with tab_treemap:
                 "CAGR": ":.2%",
                 "SlopePerYear": ":.2f",
             },
-            color_continuous_scale="Bluered",
+            color_continuous_scale="RdBu_r",
         )
         fig.update_layout(margin=dict(t=30, l=5, r=5, b=5))
         st.plotly_chart(fig, use_container_width=True)
