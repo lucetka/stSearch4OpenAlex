@@ -2,3 +2,6 @@
 streamlit>=1.33
 pandas
 requests
+
+# Interactive charts
+plotly>=5.20
