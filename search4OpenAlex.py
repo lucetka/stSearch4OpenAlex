@@ -1,183 +1,88 @@
-### experimental app for retrieving OA datasets for experimenting in 
-###
-###_calvados with 2 falvors of impact : total/cumulative, and IF window and added abstract requirement toggle
+# stSearchDashOpenAlex_espresso_patched_v2.py
+#
+# Known issue: some journals such as BBA series or Analytical Biochemistry retrieve dramatically fewer records than from WoS or the OpenAlex web interface; under investigation
+# Known issue: sometimes Meeting Abstracts are wrongly classified as Articles --> here on the other hand results are blown up with "wrong" results; for now,
+# I recommend checking the expected number of records and cleaning downloaded results in excel if necessary. The Meeting Abstracts all started with the word Abstract in the title,
+# so for my dataset from J Biological Chemistry I was able to simply chuck them in Excel but filtering for the word Abstract in the title et voila the number of records matches WoS
 
-### Current behavior:
-### 👉 Journal overrides keyword (keyword is ignored)
-### Actual query:
-### 👉 Journal AND year filters only
-### Not:
-### 👉 Journal AND keyword
-###
-### turning Search4OpenAlex to enable "dashboarding"
-
-### this is an ultraquick prototype: I'm asking Copilot to help me implement
-### some of the same functionality that I have in stClusterViz (which in turn comes from my old Jupyter notebooks),
-### Here strating with just OpenAlex primary topic and growth rates
+# SPECTER2 toggle is present but DISABLED for now (deployment safety).
 
 import time
 import json
-import requests
-import pandas as pd
-import streamlit as st
-from typing import Optional, Dict, Any, List, Tuple
-import numpy as np
-import plotly.express as px
+import re
 import io
+from typing import Optional, Dict, Any, List
 
+import pandas as pd
+import requests
+import streamlit as st
+import plotly.express as px
 
 WORKS_URL = "https://api.openalex.org/works"
 SOURCES_URL = "https://api.openalex.org/sources"
+SUBFIELDS_URL = "https://api.openalex.org/subfields"
+
+
+# ----------------------------
+# Cached taxonomy: Subfields
+# ----------------------------
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_all_subfields(api_key: str = "", mailto: str = "") -> pd.DataFrame:
+    """Fetch all OpenAlex subfields (3rd level taxonomy) into a DataFrame.
+
+    Cached for 24h to avoid repeated calls.
+    """
+    session = requests.Session()
+    rows: List[Dict[str, Any]] = []
+
+    cursor = "*"
+    while True:
+        params: Dict[str, Any] = {
+            "per_page": 200,
+            "cursor": cursor,
+            "select": ",".join(["id", "display_name", "field", "domain"]),
+        }
+        if api_key:
+            params["api_key"] = api_key
+        if mailto:
+            params["mailto"] = mailto
+
+        r = session.get(SUBFIELDS_URL, params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        for s in results:
+            sid_url = s.get("id") or ""
+            sid = sid_url.rsplit("/", 1)[-1] if sid_url else ""
+            field = s.get("field") or {}
+            domain = s.get("domain") or {}
+            rows.append({
+                "subfield_id": sid,
+                "subfield_id_url": sid_url,
+                "subfield": s.get("display_name") or "",
+                "field": field.get("display_name") or "",
+                "domain": domain.get("display_name") or "",
+            })
+
+        cursor = (data.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["label"] = df.apply(lambda r: f"{r['subfield']}  —  {r['field']} / {r['domain']}".strip(), axis=1)
+    df = df.sort_values(["domain", "field", "subfield"], kind="stable").reset_index(drop=True)
+    return df
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-
-
-def compute_topic_growth_table(
-    df: pd.DataFrame,
-    topic_col: str = "PrimaryTopic",
-    year_col: str = "PublicationYear",
-    start_year: int = 2025,
-    end_year: int = 2026,
-    smoothing: float = 1.0,
-    min_total: int = 5,
-) -> pd.DataFrame:
-    """
-    Returns one row per topic with:
-      Topic, N_total, N_start, N_end, Delta, CAGR, SlopePerYear
-    """
-    if df is None or df.empty or topic_col not in df.columns or year_col not in df.columns:
-        return pd.DataFrame(columns=["Topic", "N_total", "N_start", "N_end", "Delta", "CAGR", "SlopePerYear"])
-
-    d = df[[topic_col, year_col]].copy()
-    d[year_col] = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
-    d = d.dropna(subset=[topic_col, year_col])
-    d[topic_col] = d[topic_col].astype(str)
-
-    # total counts per topic (in currently retrieved dataset)
-    totals = d.groupby(topic_col).size().rename("N_total")
-
-    # counts in start/end year
-    c_start = d[d[year_col] == start_year].groupby(topic_col).size().rename("N_start")
-    c_end = d[d[year_col] == end_year].groupby(topic_col).size().rename("N_end")
-
-    out = pd.concat([totals, c_start, c_end], axis=1).fillna(0)
-    out["N_start"] = out["N_start"].astype(int)
-    out["N_end"] = out["N_end"].astype(int)
-    out["N_total"] = out["N_total"].astype(int)
-
-    # optionally filter tiny topics
-    out = out[out["N_total"] >= int(min_total)].copy()
-
-    years = max(int(end_year) - int(start_year), 1)
-    out["Delta"] = out["N_end"] - out["N_start"]
-
-    # CAGR with smoothing (prevents div-by-zero, avoids infinite growth)
-    out["CAGR"] = ((out["N_end"] + smoothing) / (out["N_start"] + smoothing)) ** (1 / years) - 1
-
-    # simple slope per year
-    out["SlopePerYear"] = out["Delta"] / years
-
-    out = out.reset_index().rename(columns={topic_col: "Topic"})
-    return out
-
-def extract_primary_topic_fields(work: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Flatten work['primary_topic'] into a few useful columns.
-    """
-    pt = work.get("primary_topic") or {}
-    if not isinstance(pt, dict):
-        pt = {}
-
-    # These sub-objects are typically nested dictionaries
-    domain = (pt.get("domain") or {}) if isinstance(pt.get("domain"), dict) else {}
-    field = (pt.get("field") or {}) if isinstance(pt.get("field"), dict) else {}
-    subfield = (pt.get("subfield") or {}) if isinstance(pt.get("subfield"), dict) else {}
-
-    return {
-        "PrimaryTopic": pt.get("display_name", ""),
-        "PrimaryTopicID": (pt.get("id", "") or "").rsplit("/", 1)[-1],  # Txxxx
-        "Domain": domain.get("display_name", ""),
-        "Field": field.get("display_name", ""),
-        "Subfield": subfield.get("display_name", ""),
-    }
-
-
-def topics_to_strings(work: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]:
-    """
-    Flatten work['topics'] list into CSV-friendly strings.
-    Keeps top N topics (by score if present).
-    """
-    topics = work.get("topics") or []
-    if not isinstance(topics, list):
-        topics = []
-
-    # Some topics include "score". Sort if present, else keep order.
-    def score(t):
-        s = t.get("score")
-        return s if isinstance(s, (int, float)) else -1
-
-    topics_sorted = sorted(
-        [t for t in topics if isinstance(t, dict)],
-        key=score,
-        reverse=True
-    )
-
-    top = topics_sorted[:top_n]
-    names = [t.get("display_name", "") for t in top if t.get("display_name")]
-    ids = [(t.get("id", "") or "").rsplit("/", 1)[-1] for t in top if t.get("id")]
-
-    return {
-        "TopicsTopN": "; ".join(names),
-        "TopicIDsTopN": "; ".join(ids),
-        "TopicsCount": len(topics),
-    }
-
-def add_citations_by_year_columns(df: pd.DataFrame, years: list[int],
-                                 src_col: str = "CountsByYear",
-                                 drop_src: bool = True,
-                                 also_keep_json: bool = False) -> pd.DataFrame:
-    """
-    Expand df[src_col] (list of dicts like {"year": 2026, "cited_by_count": 5})
-    into wide columns for each year in `years`. Missing years -> 0.
-
-    drop_src=True will remove the raw object column to avoid [object Object] display.
-    also_keep_json=True keeps a JSON-string version for export/debug.
-    """
-    if src_col not in df.columns:
-        return df
-
-    # Ensure we have a writable copy
-    df = df.copy()
-
-    # optional: keep readable version of the raw data
-    if also_keep_json:
-        df[f"{src_col}_json"] = df[src_col].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, list) else "")
-
-    # start with zeros
-    for y in years:
-        df[str(y)] = 0
-
-    # fill from CountsByYear
-    for i, items in enumerate(df[src_col]):
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            y = item.get("year")
-            c = item.get("cited_by_count", 0)
-            if y in years:
-                df.at[i, str(y)] = c
-
-    if drop_src:
-        df = df.drop(columns=[src_col])
-
-    return df
-
-
 
 def invert_index_to_text(inv: Optional[Dict[str, List[int]]]) -> str:
     """Reconstruct abstract text from OpenAlex abstract_inverted_index."""
@@ -195,93 +100,18 @@ def invert_index_to_text(inv: Optional[Dict[str, List[int]]]) -> str:
 
 
 def safe_get_journal_from_primary_location(work: Dict[str, Any]) -> str:
-    """
-    host_venue is deprecated; use primary_location.source.display_name instead.
-    """
     pl = work.get("primary_location") or {}
     src = pl.get("source") or {}
     return src.get("display_name") or ""
 
 
-def build_works_params(
-    cursor: str,
-    mode: str,
-    keyword_query: str,
-    year_from: Optional[int],
-    year_to: Optional[int],
-    api_key: Optional[str],
-    mailto: Optional[str],
-    per_page: int = 200,
-    source_id: Optional[str] = None,
-    require_abstract: bool = True,
-) -> Dict[str, Any]:
-    """
-    Build query params for /works.
-
-    Notes:
-    - Use per_page (underscore) for paging/cursor paging.
-    - Use primary_location (host_venue is deprecated).
-    - Combine filters with commas = AND.
-    """
-    #filters = ["has_doi:true", "has_abstract:true"]
-
-    filters = ["has_doi:true"]
-    if require_abstract:
-        filters.append("has_abstract:true")
-
-    if year_from is not None:
-        filters.append(f"from_publication_date:{year_from}-01-01")
-    if year_to is not None:
-        filters.append(f"to_publication_date:{year_to}-12-31")
-
-    if source_id:
-        # Filter works to a specific journal/venue source
-        filters.append(f"primary_location.source.id:{source_id}")
-
-    params: Dict[str, Any] = {
-        "filter": ",".join(filters),
-        "per_page": per_page,   # IMPORTANT: underscore
-        "cursor": cursor,
-        "select": ",".join([
-            "id",
-            "doi",
-            "display_name",
-            "abstract_inverted_index",
-            
-            "primary_topic",
-            "topics",
-
-            "publication_year",
-            "publication_date",
-            "primary_location",
-            "type",
-            "cited_by_count",
-            "counts_by_year",
-            "referenced_works_count",
-        ]),
-    }
-
-    # Optional keyword search (works search across titles/abstracts/etc.)
-    if mode == "Life science keyword" and keyword_query.strip() and not source_id:
-        params["search"] = keyword_query.strip()
-
-    if api_key and api_key.strip():
-        params["api_key"] = api_key.strip()
-    if mailto and mailto.strip():
-        params["mailto"] = mailto.strip()
-
-    return params
+def source_id_short(openalex_source_id_url: str) -> str:
+    if not openalex_source_id_url:
+        return ""
+    return openalex_source_id_url.rsplit("/", 1)[-1]
 
 
-def find_sources_by_name(
-    journal_query: str,
-    api_key: Optional[str],
-    mailto: Optional[str],
-    max_results: int = 25,
-) -> List[Dict[str, Any]]:
-    """
-    Search OpenAlex sources (journals/venues) by name string.
-    """
+def find_sources_by_name(journal_query: str, api_key: str = "", mailto: str = "", max_results: int = 25) -> List[Dict[str, Any]]:
     if not journal_query.strip():
         return []
 
@@ -297,57 +127,253 @@ def find_sources_by_name(
             "type",
             "works_count",
             "cited_by_count",
-        ]),
+        ])
     }
-
-    if api_key and api_key.strip():
-        params["api_key"] = api_key.strip()
-    if mailto and mailto.strip():
-        params["mailto"] = mailto.strip()
+    if api_key:
+        params["api_key"] = api_key
+    if mailto:
+        params["mailto"] = mailto
 
     r = requests.get(SOURCES_URL, params=params, timeout=60)
     r.raise_for_status()
-    data = r.json()
-    return data.get("results", [])
+    return r.json().get("results", [])
+
+
+def add_citations_by_year_columns(df: pd.DataFrame, years: List[int], src_col: str = "CountsByYear", drop_src: bool = True) -> pd.DataFrame:
+    """Expand CountsByYear list (list of dicts) into wide year columns."""
+    if df is None or df.empty or src_col not in df.columns:
+        return df
+
+    out = df.copy()
+    for y in years:
+        out[str(y)] = 0
+
+    for i, items in enumerate(out[src_col]):
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            y = item.get("year")
+            c = item.get("cited_by_count", 0)
+            if y in years:
+                out.at[i, str(y)] = c
+
+    if drop_src:
+        out = out.drop(columns=[src_col])
+
+    return out
+
+
+def compute_topic_growth_table(
+    df: pd.DataFrame,
+    topic_col: str = "PrimaryTopic",
+    year_col: str = "PublicationYear",
+    start_year: int = 2023,
+    end_year: int = 2025,
+    smoothing: float = 1.0,
+    min_total: int = 5,
+) -> pd.DataFrame:
+    """Aggregate paper counts per topic and compute growth metrics."""
+    if df is None or df.empty or topic_col not in df.columns or year_col not in df.columns:
+        return pd.DataFrame(columns=["Topic", "N_total", "N_start", "N_end", "Delta", "CAGR", "SlopePerYear"]) 
+
+    d = df[[topic_col, year_col]].copy()
+    d[year_col] = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+    d = d.dropna(subset=[topic_col, year_col])
+    d[topic_col] = d[topic_col].astype(str)
+
+    totals = d.groupby(topic_col).size().rename("N_total")
+    c_start = d[d[year_col] == int(start_year)].groupby(topic_col).size().rename("N_start")
+    c_end = d[d[year_col] == int(end_year)].groupby(topic_col).size().rename("N_end")
+
+    out = pd.concat([totals, c_start, c_end], axis=1).fillna(0)
+    out["N_total"] = out["N_total"].astype(int)
+    out["N_start"] = out["N_start"].astype(int)
+    out["N_end"] = out["N_end"].astype(int)
+
+    out = out[out["N_total"] >= int(min_total)].copy()
+
+    years = max(int(end_year) - int(start_year), 1)
+    out["Delta"] = out["N_end"] - out["N_start"]
+    out["CAGR"] = ((out["N_end"] + float(smoothing)) / (out["N_start"] + float(smoothing))) ** (1 / years) - 1
+    out["SlopePerYear"] = out["Delta"] / years
+
+    out = out.reset_index().rename(columns={topic_col: "Topic"})
+    return out
+
+
+def compute_topic_impact_table_alltime(df: pd.DataFrame, agg: str = "Mean", min_n: int = 5) -> pd.DataFrame:
+    """Impact A: all-time citations per paper by topic (mean/median)."""
+    if df is None or df.empty or "PrimaryTopic" not in df.columns or "CitedByCount" not in df.columns:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    d = df[["PrimaryTopic", "CitedByCount"]].copy()
+    d["PrimaryTopic"] = d["PrimaryTopic"].fillna("(Unknown)").astype(str)
+    d["CitedByCount"] = pd.to_numeric(d["CitedByCount"], errors="coerce")
+
+    g = d.groupby("PrimaryTopic")
+    n = g.size().rename("N")
+    if agg == "Median":
+        imp = g["CitedByCount"].median()
+    else:
+        imp = g["CitedByCount"].mean()
+
+    out = pd.concat([n, imp.rename("Impact")], axis=1).reset_index().rename(columns={"PrimaryTopic": "Topic"})
+    out["IsSmall"] = out["N"] < int(min_n)
+    return out
+
+
+def compute_topic_impact_table_ifwindow(df: pd.DataFrame, X: int, agg: str = "Mean", min_n: int = 5) -> pd.DataFrame:
+    """Impact B: citations in year X to papers published in X-1 and X-2 (mean/median per paper), by topic.
+
+    Requires year columns as strings (e.g., '2025') OR CountsByYear already expanded.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    if "PrimaryTopic" not in df.columns or "PublicationYear" not in df.columns:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    colX = str(int(X))
+    if colX not in df.columns:
+        # cannot compute
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    d = df[["PrimaryTopic", "PublicationYear", colX]].copy()
+    d["PrimaryTopic"] = d["PrimaryTopic"].fillna("(Unknown)").astype(str)
+    d["PublicationYear"] = pd.to_numeric(d["PublicationYear"], errors="coerce").astype("Int64")
+    d[colX] = pd.to_numeric(d[colX], errors="coerce").fillna(0)
+
+    d = d[d["PublicationYear"].isin([int(X) - 1, int(X) - 2])].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    g = d.groupby("PrimaryTopic")
+    n = g.size().rename("N")
+    if agg == "Median":
+        imp = g[colX].median()
+    else:
+        imp = g[colX].mean()
+
+    out = pd.concat([n, imp.rename("Impact")], axis=1).reset_index().rename(columns={"PrimaryTopic": "Topic"})
+    out["IsSmall"] = out["N"] < int(min_n)
+    return out
+
+
+# ----------------------------
+# OpenAlex fetch
+# ----------------------------
+
+def build_works_params(
+    cursor: str,
+    keyword_query: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    api_key: str,
+    mailto: str,
+    per_page: int,
+    source_ids: Optional[List[str]] = None,
+    subfield_id: Optional[str] = None,
+    require_abstract: bool = True,
+    require_doi: bool = True,
+    include_xpac: bool = True,
+) -> Dict[str, Any]:
+    filters: List[str] = []
+    if require_doi:
+        filters.append("has_doi:true")
+    if require_abstract:
+        filters.append("has_abstract:true")
+
+    # publication_year filtering (GUI-consistent)
+    if year_from is not None and year_to is not None:
+        filters.append(f"publication_year:{int(year_from)}-{int(year_to)}")
+    elif year_from is not None:
+        filters.append(f"publication_year:{int(year_from)}-9999")
+    elif year_to is not None:
+        filters.append(f"publication_year:0-{int(year_to)}")
+
+    if source_ids:
+        sources_val = "|".join([sid for sid in source_ids if sid])
+        if sources_val:
+            filters.append(f"primary_location.source.id:{sources_val}")
+
+    if subfield_id:
+        filters.append(f"primary_topic.subfield.id:{subfield_id}")
+
+    params: Dict[str, Any] = {
+        "filter": ",".join(filters),
+        "per_page": per_page,
+        "cursor": cursor,
+        "select": ",".join([
+            "id",
+            "doi",
+            "display_name",
+            "abstract_inverted_index",
+            "primary_topic",
+            "topics",
+            "publication_year",
+            "publication_date",
+            "primary_location",
+            "type",
+            "cited_by_count",
+            "counts_by_year",
+            "referenced_works_count",
+        ]),
+    }
+
+    if include_xpac:
+        params["include_xpac"] = "true"
+
+    if keyword_query.strip():
+        params["search"] = keyword_query.strip()
+
+    if api_key:
+        params["api_key"] = api_key
+    if mailto:
+        params["mailto"] = mailto
+
+    return params
 
 
 def fetch_works(
     n_rows: int,
-    mode: str,
     keyword_query: str,
     year_from: Optional[int],
     year_to: Optional[int],
-    api_key: Optional[str],
-    mailto: Optional[str],
+    api_key: str,
+    mailto: str,
     sleep_s: float,
-    source_id: Optional[str] = None,
+    source_ids: Optional[List[str]] = None,
+    subfield_id: Optional[str] = None,
     require_abstract: bool = True,
+    require_doi: bool = True,
+    include_xpac: bool = True,
     progress_cb=None,
     status_cb=None,
 ) -> pd.DataFrame:
-    """
-    Cursor-page through /works until we collect n_rows.
-    """
     session = requests.Session()
-    headers = {"User-Agent": "streamlit-openalex-demo-builder/1.0"}
+    headers = {"User-Agent": "streamlit-openalex-search/espresso-v2"}
 
     cursor = "*"
     collected = 0
     page_count = 0
-    rows = []
+    rows: List[Dict[str, Any]] = []
 
     while collected < n_rows:
         params = build_works_params(
             cursor=cursor,
-            mode=mode,
             keyword_query=keyword_query,
             year_from=year_from,
             year_to=year_to,
             api_key=api_key,
             mailto=mailto,
             per_page=200,
-            source_id=source_id,
+            source_ids=source_ids,
+            subfield_id=subfield_id,
             require_abstract=require_abstract,
+            require_doi=require_doi,
+            include_xpac=include_xpac,
         )
 
         r = session.get(WORKS_URL, params=params, headers=headers, timeout=60)
@@ -367,23 +393,19 @@ def fetch_works(
         for w in results:
             doi = w.get("doi") or ""
             title = w.get("display_name") or ""
-            #abstract = invert_index_to_text(w.get("abstract_inverted_index"))
             abstract = invert_index_to_text(w.get("abstract_inverted_index"))
 
-            # Always require DOI + title, but make abstract optional via toggle
-            if not (doi and title):
+            if not title:
                 continue
-
+            if require_doi and not doi:
+                continue
             if require_abstract and not abstract:
                 continue
 
-            if not (doi and title and abstract):
-                continue
             row = {
                 "DOI": doi,
                 "Title": title,
-                #"Abstract": abstract,
-                "Abstract": abstract or "",   # ✅ keep empty string 
+                "Abstract": abstract or "",
                 "PublicationYear": w.get("publication_year"),
                 "PublicationDate": w.get("publication_date"),
                 "JournalOrVenue": safe_get_journal_from_primary_location(w),
@@ -395,12 +417,22 @@ def fetch_works(
                 "OpenAlexURL": w.get("id"),
             }
 
-            # ✅ add flattened topic metadata here
-            row.update(extract_primary_topic_fields(w))
-            row.update(topics_to_strings(w, top_n=5))
+            pt = w.get("primary_topic") or {}
+            if isinstance(pt, dict):
+                row["PrimaryTopic"] = pt.get("display_name", "")
+                sf = pt.get("subfield") or {}
+                fld = pt.get("field") or {}
+                dom = pt.get("domain") or {}
+                row["Subfield"] = sf.get("display_name", "") if isinstance(sf, dict) else ""
+                row["Field"] = fld.get("display_name", "") if isinstance(fld, dict) else ""
+                row["Domain"] = dom.get("display_name", "") if isinstance(dom, dict) else ""
+            else:
+                row["PrimaryTopic"] = ""
+                row["Subfield"] = ""
+                row["Field"] = ""
+                row["Domain"] = ""
 
             rows.append(row)
-
             collected += 1
             if collected >= n_rows:
                 break
@@ -416,464 +448,328 @@ def fetch_works(
     return pd.DataFrame(rows)
 
 
-def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
-def source_id_short(openalex_source_id_url: str) -> str:
-    """
-    Convert 'https://openalex.org/S123' -> 'S123' (what filter expects).
-    """
-    if not openalex_source_id_url:
-        return ""
-    return openalex_source_id_url.rsplit("/", 1)[-1]
-
-
 # ----------------------------
 # Streamlit UI
 # ----------------------------
-st.set_page_config(page_title="OpenAlex Demo Dataset Builder", layout="wide")
-st.title("OpenAlex demo dataset builder")
-
-st.caption(
-    #"New use case: fetch papers by **Journal name** + **year range** (e.g., Advanced Science 2025–2026). "
-    #"Implementation: resolve journal name → OpenAlex Source ID → filter works by source.id + date range."
-    "Searching and dashboarding with OpenAlex sandbox"
+st.set_page_config(page_title="Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)", layout="wide")
+st.title("Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)")
+st.warning(
+    "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
+    "Please avoid fetching tens of thousands of records in one go without an API key. We do not want to get blocked."
+    "Start small (e.g., **500–2,000**) and only increase if necessary. "
+    "Tip: export once and save to your harddrive, you can also manually clean up and then work from **Upload CSV** to avoid re-querying OpenAlex."
+    "I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
+    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles. "
 )
+
 
 with st.sidebar:
     st.header("Inputs")
 
-    # --- Journal mode ---
-    st.subheader("Journal filter (new)")
-    journal_name = st.text_input('Journal name (e.g., "Advanced Science")', value="")
-    find_journals = st.button("Find journals")
-
-    # store found journals
-    if "source_candidates" not in st.session_state:
-        st.session_state.source_candidates = []
-
-    if find_journals:
-        api_key_tmp = st.session_state.get("api_key_tmp", "")
-        mailto_tmp = st.session_state.get("mailto_tmp", "")
-        try:
-            st.session_state.source_candidates = find_sources_by_name(
-                journal_query=journal_name,
-                api_key=api_key_tmp,
-                mailto=mailto_tmp,
-                max_results=25,
-            )
-            if not st.session_state.source_candidates:
-                st.warning("No journal matches found.")
-        except Exception as e:
-            st.session_state.source_candidates = []
-            st.error(f"Journal search error: {e}")
-
-    source_candidates = st.session_state.source_candidates
-
-    selected_source_id = None
-    if source_candidates:
-        options = []
-        for s in source_candidates:
-            sid = source_id_short(s.get("id", ""))
-            name = s.get("display_name", "")
-            org = s.get("host_organization_name", "")
-            issn_l = s.get("issn_l", "")
-            typ = s.get("type", "")
-            works_count = s.get("works_count", "")
-            options.append((sid, f"{name}  |  {org}  |  ISSN-L: {issn_l}  |  type: {typ}  |  works: {works_count}"))
-
-        chosen = st.selectbox(
-            "Select the journal/venue",
-            options=options,
-            format_func=lambda x: x[1],
-        )
-        selected_source_id = chosen[0]
-        st.success(f"Selected source id: {selected_source_id}")
-
-    include_citations_by_year = st.checkbox("Add citations by year columns", value=False)
-    cite_year_from = st.number_input("Cite year from", 1900, 2100, 2017)
-    cite_year_to   = st.number_input("Cite year to",   1900, 2100, 2026)
-
-    require_abstract = st.checkbox(
-        "Require abstract (exclude items without abstract)",
-        value=True,
-        help="Turn off to include records even when OpenAlex has no abstract for them."
-    )       
-
-
-    # --- Other modes still available ---
-    st.subheader("Other search modes (optional)")
-    mode = st.selectbox("Mode", ["Broad", "Life science keyword"], index=0)
-    keyword_query = ""
-    if mode == "Life science keyword":
-        keyword_query = st.text_input("Keyword (used only if no journal is selected)", value="cancer")
-
-    st.subheader("Year range")
-    col1, col2 = st.columns(2)
-    with col1:
-        year_from_enabled = st.checkbox("Enable year_from", value=True)
-        year_from = st.number_input("Year from", min_value=1900, max_value=2100, value=2025, step=1)
-    with col2:
-        year_to_enabled = st.checkbox("Enable year_to", value=True)
-        year_to = st.number_input("Year to", min_value=1900, max_value=2100, value=2026, step=1)
-
-    year_from_val = int(year_from) if year_from_enabled else None
-    year_to_val = int(year_to) if year_to_enabled else None
-
-    st.subheader("Sampling")
-    n_rows = st.number_input("Rows to collect", min_value=100, max_value=50000, value=5000, step=100)
+    data_source = st.radio(
+        "Data source",
+        ["Fetch from OpenAlex", "Upload CSV"],
+        index=0,
+        help="Upload mode loads a previously exported CSV and does not apply OpenAlex search filters (by design)."
+    )
 
     st.subheader("API (optional)")
     api_key = st.text_input("OpenAlex API key (optional)", value="", type="password")
     mailto = st.text_input("Contact email (optional)", value="")
 
-    # stash for journal search button
-    st.session_state.api_key_tmp = api_key
-    st.session_state.mailto_tmp = mailto
+    uploaded_file = None
+    if data_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload app-exported CSV", type=["csv"])
 
-    st.subheader("Politeness")
-    sleep_s = st.slider("Sleep between requests (seconds)", 0.0, 1.0, 0.2, 0.05)
+    # Fetch-mode controls
+    if data_source == "Fetch from OpenAlex":
+        st.subheader("Query")
+        keyword_query = st.text_area("Keyword / phrase query (Boolean allowed; can be empty)", value="", height=70)
 
-    go = st.button("Fetch dataset", type="primary")
+        st.subheader("Journal filter")
+        journal_lookup = st.text_input('Journal lookup (e.g., "Nature")', value="")
+        find_journals = st.button("Find journals")
 
+        if "source_candidates" not in st.session_state:
+            st.session_state.source_candidates = []
 
+        if find_journals:
+            try:
+                st.session_state.source_candidates = find_sources_by_name(journal_lookup, api_key=api_key, mailto=mailto, max_results=25)
+            except Exception as e:
+                st.session_state.source_candidates = []
+                st.error(f"Journal search error: {e}")
+
+        selected_source_ids: List[str] = []
+        if st.session_state.source_candidates:
+            options = []
+            for s in st.session_state.source_candidates:
+                sid = source_id_short(s.get("id", ""))
+                name = s.get("display_name", "")
+                org = s.get("host_organization_name", "")
+                issn_l = s.get("issn_l", "")
+                typ = s.get("type", "")
+                options.append((sid, f"{name} | {org} | ISSN-L: {issn_l} | type: {typ}"))
+
+            picked = st.multiselect("Select journal(s) (OR across selected journals)", options=options, format_func=lambda x: x[1])
+            selected_source_ids = [x[0] for x in picked]
+
+        st.subheader("Subfield filter (OpenAlex taxonomy)")
+        subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
+        subfield_choice = st.selectbox(
+            "Subfield (3rd level) — optional",
+            options=["(none)"] + (subfields_df["label"].tolist() if not subfields_df.empty else []),
+            index=0,
+        )
+        subfield_id = None
+        if subfield_choice != "(none)" and not subfields_df.empty:
+            subfield_id = subfields_df.loc[subfields_df["label"] == subfield_choice, "subfield_id"].iloc[0]
+
+        st.subheader("Year range")
+        year_from_val, year_to_val = st.slider("Publication years", min_value=1900, max_value=2100, value=(2023, 2025), step=1)
+
+        st.subheader("Coverage toggles")
+        include_xpac = st.checkbox("Include xpac (expansion pack) works", value=True)
+        require_doi = st.checkbox("Require DOI", value=True)
+        require_abstract = st.checkbox("Require abstract", value=True)
+
+        st.subheader("Sampling")
+        n_rows = st.number_input("Rows to collect", min_value=100, max_value=50000, value=5000, step=500)
+
+        st.subheader("Citations by year")
+        include_citations_by_year = st.checkbox("Add citations by year columns", value=False)
+        cite_year_from = st.number_input("Cite year from", 1900, 2100, 2017)
+        cite_year_to = st.number_input("Cite year to", 1900, 2100, 2025)
+
+        # SPECTER2 toggle (disabled for now)
+        st.subheader("Embeddings (optional)")
+        fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=True)
+
+        st.subheader("Politeness")
+        sleep_s = st.slider("Sleep between OpenAlex requests (s)", 0.0, 1.0, 0.2, 0.05)
+
+        go = st.button("Fetch dataset", type="primary")
+
+# Session storage
 if "df" not in st.session_state:
     st.session_state.df = None
 
-if go:
+# Upload path
+if data_source == "Upload CSV" and uploaded_file is not None:
+    try:
+        df_up = pd.read_csv(uploaded_file, low_memory=False)
+        st.session_state.df = df_up
+        st.success(f"Loaded uploaded CSV with {len(df_up):,} rows")
+    except Exception as e:
+        st.session_state.df = None
+        st.error(f"Upload failed: {e}")
+
+# Fetch path
+if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
     progress = st.progress(0.0)
     status = st.empty()
+
     try:
         with st.spinner("Querying OpenAlex…"):
             df = fetch_works(
                 n_rows=int(n_rows),
-                mode=mode,
                 keyword_query=keyword_query,
-                year_from=year_from_val,
-                year_to=year_to_val,
+                year_from=int(year_from_val),
+                year_to=int(year_to_val),
                 api_key=api_key,
                 mailto=mailto,
                 sleep_s=float(sleep_s),
-                source_id=selected_source_id,
+                source_ids=selected_source_ids or None,
+                subfield_id=subfield_id,
                 require_abstract=require_abstract,
+                require_doi=require_doi,
+                include_xpac=include_xpac,
                 progress_cb=progress.progress,
                 status_cb=status.write,
             )
 
-            # ✅ ADD HERE (before saving into session state)
-            if include_citations_by_year:  # your checkbox/toggle
-                years = list(range(cite_year_from, cite_year_to + 1))
-                df = add_citations_by_year_columns(df, years)
+            if include_citations_by_year:
+                y1, y2 = int(cite_year_from), int(cite_year_to)
+                if y1 <= y2:
+                    years = list(range(y1, y2 + 1))
+                    df = add_citations_by_year_columns(df, years, src_col="CountsByYear", drop_src=True)
 
-            #years = list(range(2023, 2027))  # or dynamically from year_from/year_to   ########################### change this to dynamic
-            #df = add_citations_by_year_columns(df, years)    
         st.session_state.df = df
         status.success(f"Done. Collected {len(df):,} rows.")
+
     except Exception as e:
         st.session_state.df = None
         status.error(f"Error: {e}")
 
 
-
-
-import plotly.express as px
-import pandas as pd
-
 df = st.session_state.df
 
 if df is None or df.empty:
-    st.info("Fetch a dataset first.")
+    st.info("No dataset loaded yet. Fetch from OpenAlex or upload a CSV.")
     st.stop()
 
-tab_preview, tab_treemap, tab_impact, tab_download = st.tabs([
+# ----------------------------
+# Tabs
+# ----------------------------
+tab_preview, tab_growth, tab_impact, tab_download = st.tabs([
     "📄 Preview",
     "🟩 Treemap (Topics growth)",
     "🟧 Treemap (Impact)",
-    "⬇ Download"
+    "⬇ Download",
 ])
 
-
-# ----------------------------
-# Tab 1: Preview
-# ----------------------------
 with tab_preview:
     st.subheader("Preview")
     st.dataframe(df.head(50), use_container_width=True)
 
     if "Abstract" in df.columns:
-        st.caption(f"Abstract coverage: {(df['Abstract'].astype(str).str.len() > 0).mean():.1%}")
+        abs_cov = (df["Abstract"].fillna("").astype(str).str.strip().str.len() > 0).mean()
+        st.caption(f"Abstract coverage: {abs_cov:.1%}")
 
-    st.subheader("Quick stats")
+    # Quick stats
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows", f"{len(df):,}")
     c2.metric("Unique DOIs", f"{df['DOI'].nunique():,}" if "DOI" in df.columns else "—")
-
     if "PublicationYear" in df.columns:
-        years = pd.to_numeric(df["PublicationYear"], errors="coerce")
-        c3.metric("Year min", f"{int(years.min())}" if years.notna().any() else "—")
-        c4.metric("Year max", f"{int(years.max())}" if years.notna().any() else "—")
-    else:
-        c3.metric("Year min", "—")
-        c4.metric("Year max", "—")
+        ys = pd.to_numeric(df["PublicationYear"], errors="coerce")
+        c3.metric("Year min", f"{int(ys.min())}" if ys.notna().any() else "—")
+        c4.metric("Year max", f"{int(ys.max())}" if ys.notna().any() else "—")
 
 
-# ----------------------------
-# Tab 2: Treemap (PrimaryTopic)
-# ----------------------------
-with tab_treemap:
-    st.subheader("Treemap by Primary Topic")
+with tab_growth:
+    st.subheader("Treemap by Primary Topic (Growth)")
     st.caption("Size = number of papers in dataset. Color = growth over selected years.")
 
-    # Basic validation
     if "PrimaryTopic" not in df.columns or "PublicationYear" not in df.columns:
-        st.warning("Need columns 'PrimaryTopic' and 'PublicationYear' in df to build this treemap.")
-        st.stop()
-
-    # pick available year bounds from the data
-    year_series = pd.to_numeric(df["PublicationYear"], errors="coerce")
-    if not year_series.notna().any():
-        st.warning("PublicationYear has no valid numeric values.")
-        st.stop()
-
-    y_min = int(year_series.min())
-    y_max = int(year_series.max())
-
-    colA, colB, colC = st.columns([1, 1, 1])
-    with colA:
-        start_year = st.number_input(
-            "Growth start year",
-            min_value=1900, max_value=2100,
-            value=max(y_min, y_max - 1),
-            step=1
-        )
-    with colB:
-        end_year = st.number_input(
-            "Growth end year",
-            min_value=1900, max_value=2100,
-            value=y_max,
-            step=1
-        )
-    with colC:
-        metric = st.selectbox("Color metric", ["CAGR", "SlopePerYear"], index=0)
-
-    colD, colE = st.columns([1, 1])
-    with colD:
-        smoothing = st.slider(
-            "CAGR smoothing",
-            min_value=0.0, max_value=5.0,
-            value=1.0, step=0.5,
-            help="Avoids extreme growth when start-year count is 0."
-        )
-    with colE:
-        min_total = st.number_input(
-            "Minimum topic size (N_total)",
-            min_value=1, max_value=5000,
-            value=5, step=1
-        )
-
-    # compute growth table (topic-level)
-    topic_tbl = compute_topic_growth_table(
-        df=df,
-        topic_col="PrimaryTopic",
-        year_col="PublicationYear",
-        start_year=int(start_year),
-        end_year=int(end_year),
-        smoothing=float(smoothing),
-        min_total=int(min_total),
-    )
-
-    if topic_tbl.empty:
-        st.info("No topics available after filtering. Try lowering minimum size or adjusting years.")
+        st.warning("Need 'PrimaryTopic' and 'PublicationYear' columns.")
     else:
-        fig = px.treemap(
-            topic_tbl,
-            path=["Topic"],        # single-level treemap
-            values="N_total",      # size
-            color=metric,          # growth metric
-            hover_data={
-                "N_total": True,
-                "N_start": True,
-                "N_end": True,
-                "Delta": True,
-                "CAGR": ":.2%",
-                "SlopePerYear": ":.2f",
-            },
-            color_continuous_scale="RdBu_r",
-        )
-        fig.update_layout(coloraxis_cmid=0)
-        fig.update_layout(margin=dict(t=30, l=5, r=5, b=5))
-        st.plotly_chart(fig, use_container_width=True)
+        year_series = pd.to_numeric(df["PublicationYear"], errors="coerce")
+        year_series = year_series.dropna().astype(int)
+        if year_series.empty:
+            st.warning("PublicationYear has no valid numeric values.")
+        else:
+            y_min, y_max = int(year_series.min()), int(year_series.max())
 
-        
-        html_buf = io.StringIO()
-        fig.write_html(html_buf, include_plotlyjs="cdn", full_html=True)
+            colA, colB, colC = st.columns([1, 1, 1])
+            with colA:
+                start_year = st.number_input("Growth start year", min_value=1900, max_value=2100, value=max(y_min, y_max - 1), step=1)
+            with colB:
+                end_year = st.number_input("Growth end year", min_value=1900, max_value=2100, value=y_max, step=1)
+            with colC:
+                metric = st.selectbox("Color metric", ["CAGR", "SlopePerYear"], index=0)
 
-        st.download_button(
-            label="⬇ Download treemap (HTML)",
-            data=html_buf.getvalue().encode("utf-8"),
-            file_name="treemap_topics.html",
-            mime="text/html",
-        )
+            colD, colE = st.columns([1, 1])
+            with colD:
+                smoothing = st.slider("CAGR smoothing", 0.0, 5.0, 1.0, 0.5)
+            with colE:
+                min_total = st.number_input("Minimum topic size (N_total)", min_value=1, max_value=5000, value=5, step=1)
 
+            tbl = compute_topic_growth_table(
+                df=df,
+                topic_col="PrimaryTopic",
+                year_col="PublicationYear",
+                start_year=int(start_year),
+                end_year=int(end_year),
+                smoothing=float(smoothing),
+                min_total=int(min_total),
+            )
 
-        with st.expander("Show topic growth table"):
-            st.dataframe(topic_tbl.sort_values(metric, ascending=False), use_container_width=True)
+            if tbl.empty:
+                st.info("No topics available after filtering.")
+            else:
+                fig = px.treemap(
+                    tbl,
+                    path=["Topic"],
+                    values="N_total",
+                    color=metric,
+                    hover_data={
+                        "N_total": True,
+                        "N_start": True,
+                        "N_end": True,
+                        "Delta": True,
+                        "CAGR": ":.2%",
+                        "SlopePerYear": ":.2f",
+                    },
+                    color_continuous_scale="RdBu_r",
+                )
+                # Center diverging scale at 0
+                fig.update_layout(coloraxis_cmid=0, margin=dict(t=30, l=5, r=5, b=5))
+                st.plotly_chart(fig, use_container_width=True)
 
-# ----------------------------
-# Tab: Impact Treemap
-# ----------------------------
+                # Download interactive HTML (Growth treemap)
+                growth_html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+                st.download_button(
+                    label="⬇ Download growth treemap (HTML, interactive)",
+                    data=growth_html.encode("utf-8"),
+                    file_name= f"growth_{metric}_{int(start_year)}-{int(end_year)}.html",   #"growth_treemap.html",
+                    mime="text/html",
+)
+
 
 with tab_impact:
     st.subheader("Treemap by Primary Topic (Impact)")
     st.caption("Size = number of papers. Color = impact (citations per paper).")
 
-    # --- Controls ---
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        impact_mode = st.selectbox(
-            "Impact type",
-            ["All-time", "IF-window (year X to X-1/X-2)"]
-        )
-
-    with col2:
-        agg_mode = st.selectbox(
-            "Aggregation",
-            ["Mean", "Median"]
-        )
-
-    with col3:
-        min_topic_size = st.number_input(
-            "Min papers per topic",
-            min_value=1,
-            value=5
-        )
-    
-    # detect year columns dynamically ############################################### !!!!!!!!!!!!!!!! This may need to be adjusted to make sure digits are actually years and not something else!!!!!!!!!!!!
-    year_cols = [c for c in df.columns if c.isdigit()]
-    year_cols = sorted(year_cols)
-
-    if impact_mode == "IF-window (year X to X-1/X-2)":
-        if not year_cols:
-            st.warning("No citation-by-year columns found in dataset.")
-            st.stop()
-
-        col_year = st.selectbox(
-            "Evaluation year X",
-            year_cols
-        )
-
-        # optional warning for latest year
-        if col_year == year_cols[-1]:
-            st.info("Note: selected year may be incomplete.")
-
-    # --- Build impact table ---
-    required_cols = ["PrimaryTopic", "CitedByCount"]
-
-    if not all(c in df.columns for c in required_cols):
-        st.warning("Dataset missing required columns for impact calculation.")
-        st.stop()
-
-    # drop missing topics
-    df_imp = df.dropna(subset=["PrimaryTopic"]).copy()
-
-    grouped = df_imp.groupby("PrimaryTopic")
-
-    # paper counts
-    topic_counts = grouped.size().rename("N")
-
-    # aggregation
-    # ========================
-    # IMPACT CALCULATION
-    # ========================
-
-    if impact_mode == "All-time":
-        if agg_mode == "Mean":
-            topic_impact = grouped["CitedByCount"].mean()
-        else:
-            topic_impact = grouped["CitedByCount"].median()
-
+    if "PrimaryTopic" not in df.columns:
+        st.warning("Need 'PrimaryTopic' column.")
     else:
-        # IF-WINDOW
-        X = int(col_year)
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        with col1:
+            impact_mode = st.selectbox("Impact type", ["All-time", "IF-window (year X to X-1/X-2)"], index=0)
+        with col2:
+            agg_mode = st.selectbox("Aggregation", ["Mean", "Median"], index=0)
+        with col3:
+            min_topic_size = st.number_input("Min papers per topic", min_value=1, value=5, step=1)
+        with col4:
+            grey_small = st.checkbox("Grey small/undefined topics", value=True)
 
-        # required columns
-        if col_year not in df_imp.columns:
-            st.warning(f"Selected year {X} not available.")
-            st.stop()
-
-        if "PublicationYear" not in df_imp.columns:
-            st.warning("PublicationYear column required for IF-window.")
-            st.stop()
-
-        # filter denominator: papers from X-1 and X-2
-        df_window = df_imp[
-            df_imp["PublicationYear"].isin([X - 1, X - 2])
-        ].copy()
-
-        if df_window.empty:
-            st.warning("No papers in publication years X-1 or X-2.")
-            st.stop()
-
-        # get citations in year X
-        df_window["C_X"] = df_window[col_year].fillna(0)
-
-        grouped = df_window.groupby("PrimaryTopic")
-
-        topic_counts = grouped.size().rename("N")
-
-        if agg_mode == "Mean":
-            topic_impact = grouped["C_X"].mean()
+        tbl = None
+        if impact_mode == "All-time":
+            tbl = compute_topic_impact_table_alltime(df, agg=agg_mode, min_n=int(min_topic_size))
         else:
-            topic_impact = grouped["C_X"].median()
+            # Evaluation year X must be explicitly chosen; use available year columns in df
+            year_cols = sorted([c for c in df.columns if str(c).isdigit()])
+            if not year_cols:
+                st.info("No citation-by-year columns present. Enable 'Add citations by year columns' when fetching, or upload a file that includes year columns.")
+                tbl = pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"])
+            else:
+                X = int(st.selectbox("Evaluation year X", options=year_cols, index=max(0, len(year_cols) - 2)))
+                tbl = compute_topic_impact_table_ifwindow(df, X=X, agg=agg_mode, min_n=int(min_topic_size))
+
+        if tbl is None or tbl.empty:
+            st.info("No impact values available for the chosen settings.")
+        else:
+            # Use None for greyed topics if requested
+            plot_tbl = tbl.copy()
+            if grey_small and "IsSmall" in plot_tbl.columns:
+                plot_tbl.loc[plot_tbl["IsSmall"], "Impact"] = None
+
+            fig = px.treemap(
+                plot_tbl,
+                path=["Topic"],
+                values="N",
+                color="Impact",
+                color_continuous_scale="RdBu_r",
+                hover_data={"N": True, "Impact": True},
+            )
+            fig.update_layout(margin=dict(t=30, l=5, r=5, b=5))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Download interactive HTML only
+            html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+            st.download_button(
+                label="⬇ Download impact treemap (HTML, interactive)",
+                data=html.encode("utf-8"),
+                file_name="impact_treemap.html",
+                mime="text/html",
+            )
 
 
-    impact_table = pd.concat([topic_counts, topic_impact.rename("Impact")], axis=1).reset_index()
-
-    # flag small topics
-    impact_table["IsSmall"] = impact_table["N"] < min_topic_size
-
-    # --- Visualization ---
-    # Color: use grey for small topics
-    impact_table["ColorVal"] = impact_table["Impact"]
-
-    fig = px.treemap(
-        impact_table,
-        path=["PrimaryTopic"],
-        values="N",
-        color="ColorVal",
-        color_continuous_scale="RdBu_r",
-    )
-
-    # --- Manually override small nodes to grey ---
-    # (simple hack via color axis range clipping)
-    impact_table.loc[impact_table["IsSmall"], "ColorVal"] = None
-
-    fig = px.treemap(
-        impact_table,
-        path=["PrimaryTopic"],
-        values="N",
-        color="ColorVal",
-        color_continuous_scale="RdBu_r",
-    )
-
-    fig.update_traces(marker=dict(line=dict(width=0.5)))
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    # --- Debug / transparency (optional but useful)
-    with st.expander("Show impact table"):
-        st.dataframe(impact_table.sort_values("Impact", ascending=False))
-
-# ----------------------------
-# Tab 3: Download
-# ----------------------------
 with tab_download:
     st.subheader("Download")
     st.download_button(
-        "Download CSV",
+        label="Download CSV",
         data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"openalex_sample_{len(df)}.csv",
+        file_name=f"openalex_dataset_{len(df)}.csv",
         mime="text/csv",
     )
