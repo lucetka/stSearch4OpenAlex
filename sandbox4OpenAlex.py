@@ -1,11 +1,13 @@
-# This is _espresso_macchiato.py version
+# _gin is renamed stSearchDashOpenAlex_fernet_journalsAccum_v4_nostop - Copy.py
+# in _fernet I added proper multiselect for journals - even though it's not very intuitive. I shall improve it.
+# Then the disappearing button was patched --> _gin
 
-# History : I had a version mess. This version is _dornfelder_SPECTER2 from 5pm 13-May-26 "merged" into stSearchDashOpenAlex_espresso_patched_v2.py
+# I had a version mess. This version is _dornfelder_SPECTER2 from 5pm 13-May-26 "merged" into stSearchDashOpenAlex_espresso_patched_v2.py
 # saved earlier that day but actually more "advanced" - by mistake the whole SPECTER2 code was chucked instead of just GUI disabled
 # so now it was added back into "espresso". Also further missing parts were added back
 # 
 # This version was "merged" by Copilot from the two version and was named stSearchDashOpenAlex_espresso_merged_with_SPECTER2_disabled_plus_TopicID.py
-# I copied and renamed this to _espresso_macchiato.py and continued adding chatGPT functionality
+# I copied and renamed this to _espresso_macchiato.py
 
 # # in the meantime I had given Copilot the _dornfelder_SPECTER2 version to start implementing chatGPT based on my old (2024) Jupyter notebooks working with NatComm
 ## so that branch is a "cul-de-sac" and I'm going to re-do this (better hopefully, becuase the implementaion in the _dornfelder_specter2 was anyways a bit dumb
@@ -114,10 +116,21 @@ def invert_index_to_text(inv: Optional[Dict[str, List[int]]]) -> str:
 
 
 def safe_get_journal_from_primary_location(work: Dict[str, Any]) -> str:
+    """Return journal/venue name from work['primary_location']['source']['display_name'].
+    Always returns a string (never None).
+    """
     pl = work.get("primary_location") or {}
     src = pl.get("source") or {}
+    name = src.get("display_name") or ""
+    return str(name) if name is not None else ""
 
-# --- Multi-topic helper (CSV-friendly) ---
+def safe_get_source_id_from_primary_location(work: Dict[str, Any]) -> str:
+    """Return OpenAlex source id (Sxxxx) from primary_location.source.id."""
+    pl = work.get("primary_location") or {}
+    src = pl.get("source") or {}
+    sid_url = src.get("id") or ""
+    return sid_url.rsplit("/", 1)[-1] if sid_url else ""
+
 def topics_to_strings(work: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]:
     """
     Flatten work['topics'] list into CSV-friendly strings.
@@ -579,6 +592,7 @@ def fetch_works(
                 "PublicationYear": w.get("publication_year"),
                 "PublicationDate": w.get("publication_date"),
                 "JournalOrVenue": safe_get_journal_from_primary_location(w),
+                "JournalSourceID": safe_get_source_id_from_primary_location(w),
                 "WorkType": w.get("type"),
                 "CitedByCount": w.get("cited_by_count"),
                 "CountsByYear": w.get("counts_by_year") or [],
@@ -772,6 +786,207 @@ def enrich_df_with_chatgpt(
 
     return d
 
+
+
+# ----------------------------
+# Commissioning / Review-topic synthesis (group-level)
+# ----------------------------
+
+def _paper_id_from_row(row: pd.Series) -> str:
+    """Pick a stable paper ID for prompts/traceability."""
+    doi = str(row.get("DOI", "") or "").strip()
+    if doi and doi.lower() not in ("nan", "none"):
+        return doi
+    oa = str(row.get("OpenAlexID", "") or row.get("OpenAlexURL", "") or "").strip()
+    if oa and oa.lower() not in ("nan", "none"):
+        return oa
+    return str(row.name)
+
+
+def _paper_title_from_row(row: pd.Series) -> str:
+    return str(row.get("Title", "") or row.get("Article Title", "") or "").strip()
+
+
+def _paper_abstract_from_row(row: pd.Series) -> str:
+    return str(row.get("Abstract", "") or "").strip()
+
+
+def build_commissioning_prompt(papers: List[Dict[str, str]], min_support: int = 2) -> str:
+    """Build a strict prompt that asks for high-level review topics + search strategies."""
+    # We ask for JSON-only output to make parsing robust.
+    rules = (
+        "You are helping a journal editor commission review articles based on a set of research papers.\n\n"
+        "From the provided list of papers (titles + abstracts), you must:\n"
+        "1) Identify recurring scientific problems, challenges, or methodological gaps\n"
+        "2) Group related papers into coherent topic clusters\n"
+        "3) Propose high-level REVIEW ARTICLE topics (NOT paper-specific summaries)\n"
+        "4) For each topic, design a search strategy that can later be used to check novelty via web search\n\n"
+        "CRITICAL RULES:\n"
+        "- DO NOT propose topics centered on single tools (e.g. 'DeepRTAlign').\n"
+        "- ALWAYS generalize to the underlying problem (e.g. 'retention time alignment in large-scale LC-MS').\n"
+        f"- Each topic must be supported by MULTIPLE papers (minimum {min_support} if possible).\n"
+        "- Avoid trivial or overly broad topics ('proteomics advances', 'AI in biology').\n"
+        "- Focus on topics that could realistically support a full Review article.\n"
+        "- If a topic is widely known, refine it to a specific integrative synthesis angle.\n\n"
+        "OUTPUT FORMAT (JSON ONLY, no markdown, no commentary):\n"
+        "{\n"
+        "  \"topics\": [\n"
+        "    {\n"
+        "      \"topic_title\": string,\n"
+        "      \"problem_gap\": string,\n"
+        "      \"synthesis_angle\": string,\n"
+        "      \"supporting_paper_ids\": [string, ...],\n"
+        "      \"search_strategy\": {\n"
+        "         \"boolean_query\": string,\n"
+        "         \"keywords\": [string, ...],\n"
+        "         \"exclusions\": [string, ...]\n"
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+
+    lines = [rules, "PAPERS:"]
+    for p in papers:
+        pid = p.get("paper_id", "")
+        title = p.get("title", "")
+        abstract = p.get("abstract", "")
+        lines.append(f"\n[PaperID] {pid}\n[Title] {title}\n[Abstract] {abstract}")
+
+    return "\n".join(lines)
+
+
+def parse_commissioning_json(output: str) -> Dict[str, Any]:
+    """Parse JSON-only model output. Tries to recover if there's leading/trailing text."""
+    if not output:
+        return {}
+    s = output.strip()
+    # Attempt direct JSON parse
+    try:
+        return json.loads(s)
+    except Exception:
+        # Try to extract the first JSON object substring
+        m = re.search(r"\{[\s\S]*\}", s)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return {}
+        return {}
+
+
+def commissioning_run(
+    df: pd.DataFrame,
+    cluster_col: str,
+    cluster_values: List[Any],
+    max_papers: int,
+    input_mode: str,
+    custom_col: str,
+    min_support: int,
+    api_key: str,
+    model: str,
+    temperature: float,
+    progress_cb=None,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Run commissioning synthesis on a selected subset. Returns (topics_df, support_df, raw_output)."""
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    if cluster_col not in df.columns:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    sub = df[df[cluster_col].isin(cluster_values)].copy()
+    if sub.empty:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    # Keep deterministic ordering for now (Top rows) to match your current 'Top N' testing style
+    sub = sub.head(int(max_papers)).copy()
+
+    papers: List[Dict[str, str]] = []
+    for _, row in sub.iterrows():
+        pid = _paper_id_from_row(row)
+        title = _paper_title_from_row(row)
+        abstract = _paper_abstract_from_row(row)
+
+        # Build text sent according to input_mode
+        if input_mode == "Title":
+            txt = title
+        elif input_mode == "Abstract":
+            txt = abstract
+        elif input_mode == "Title + Abstract":
+            txt = (title + "\n\n" + abstract).strip()
+        else:
+            txt = str(row.get(custom_col, "") or "").strip()
+
+        # Truncate to keep prompts bounded
+        txt = txt[:3500]
+
+        papers.append({
+            "paper_id": pid,
+            "title": title[:500],
+            "abstract": txt,
+        })
+
+    prompt = build_commissioning_prompt(papers, min_support=int(min_support))
+
+    raw = openai_chat_completion(api_key=api_key, model=model, prompt=prompt, temperature=temperature)
+
+    data = parse_commissioning_json(raw)
+    topics = data.get("topics") if isinstance(data, dict) else None
+    if not isinstance(topics, list):
+        return pd.DataFrame(), pd.DataFrame(), raw
+
+    # Build outputs
+    topic_rows = []
+    support_rows = []
+
+    # Map id->title for support table
+    id_to_title = {p["paper_id"]: p.get("title", "") for p in papers}
+
+    for t in topics:
+        if not isinstance(t, dict):
+            continue
+        topic_title = str(t.get("topic_title", "")).strip()
+        problem_gap = str(t.get("problem_gap", "")).strip()
+        synth = str(t.get("synthesis_angle", "")).strip()
+        supp = t.get("supporting_paper_ids", [])
+        supp = [str(x).strip() for x in supp] if isinstance(supp, list) else []
+
+        ss = t.get("search_strategy", {}) if isinstance(t.get("search_strategy", {}), dict) else {}
+        boolean_q = str(ss.get("boolean_query", "")).strip()
+        keywords = ss.get("keywords", [])
+        exclusions = ss.get("exclusions", [])
+        if isinstance(keywords, list):
+            keywords_s = "; ".join([str(x).strip() for x in keywords if str(x).strip()])
+        else:
+            keywords_s = ""
+        if isinstance(exclusions, list):
+            exclusions_s = "; ".join([str(x).strip() for x in exclusions if str(x).strip()])
+        else:
+            exclusions_s = ""
+
+        topic_rows.append({
+            "Topic": topic_title,
+            "Problem / gap": problem_gap,
+            "Synthesis angle": synth,
+            "N_support": len(supp),
+            "Supporting IDs": "; ".join(supp),
+            "Search boolean query": boolean_q,
+            "Search keywords": keywords_s,
+            "Search exclusions": exclusions_s,
+        })
+
+        for pid in supp:
+            support_rows.append({
+                "Topic": topic_title,
+                "PaperID": pid,
+                "Paper title": id_to_title.get(pid, ""),
+            })
+
+    topics_df = pd.DataFrame(topic_rows)
+    support_df = pd.DataFrame(support_rows)
+    return topics_df, support_df, raw
+
 st.set_page_config(page_title="Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)", layout="wide")
 st.title("Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)")
 st.warning(
@@ -811,29 +1026,105 @@ with st.sidebar:
         journal_lookup = st.text_input('Journal lookup (e.g., "Nature")', value="")
         find_journals = st.button("Find journals")
 
+        # store found journals (current search results)
         if "source_candidates" not in st.session_state:
             st.session_state.source_candidates = []
 
+        # persistent journal selections across multiple searches
+        # dict: source_id -> label
+        if "selected_journals" not in st.session_state:
+            st.session_state.selected_journals = {}
+
+        # nonce counters to force widget re-instantiation (avoids StreamlitAPIException)
+        if "journals_add_nonce" not in st.session_state:
+            st.session_state.journals_add_nonce = 0
+        if "journals_remove_nonce" not in st.session_state:
+            st.session_state.journals_remove_nonce = 0
+
         if find_journals:
             try:
-                st.session_state.source_candidates = find_sources_by_name(journal_lookup, api_key=api_key, mailto=mailto, max_results=25)
+                st.session_state.source_candidates = find_sources_by_name(
+                    journal_lookup,
+                    api_key=api_key,
+                    mailto=mailto,
+                    max_results=25,
+                )
             except Exception as e:
                 st.session_state.source_candidates = []
                 st.error(f"Journal search error: {e}")
 
-        selected_source_ids: List[str] = []
-        if st.session_state.source_candidates:
-            options = []
-            for s in st.session_state.source_candidates:
-                sid = source_id_short(s.get("id", ""))
-                name = s.get("display_name", "")
-                org = s.get("host_organization_name", "")
-                issn_l = s.get("issn_l", "")
-                typ = s.get("type", "")
-                options.append((sid, f"{name} | {org} | ISSN-L: {issn_l} | type: {typ}"))
+        # Build option tuples for current search results
+        search_options = []
+        for s in st.session_state.source_candidates:
+            sid = source_id_short(s.get("id", ""))
+            if not sid:
+                continue
+            name = s.get("display_name", "")
+            org = s.get("host_organization_name", "")
+            issn_l = s.get("issn_l", "")
+            typ = s.get("type", "")
+            label = f"{name} | {org} | ISSN-L: {issn_l} | type: {typ}".strip()
+            search_options.append((sid, label))
 
-            picked = st.multiselect("Select journal(s) (OR across selected journals)", options=options, format_func=lambda x: x[1])
-            selected_source_ids = [x[0] for x in picked]
+        # 1) Add journals from latest search into the persistent selection
+        if search_options:
+            picked_to_add = st.multiselect(
+                "Search results (select journals to add)",
+                options=search_options,
+                format_func=lambda x: x[1],
+                key=f"journals_add_multiselect_{st.session_state.journals_add_nonce}",
+            )
+            col_add1, col_add2 = st.columns([1, 1])
+            with col_add1:
+                add_btn = st.button("Add selected", key="journals_add_btn")
+            with col_add2:
+                clear_results_btn = st.button("Clear search results", key="journals_clear_results_btn")
+
+            if add_btn and picked_to_add:
+                for sid, label in picked_to_add:
+                    st.session_state.selected_journals[sid] = label
+                # bump nonce to clear the multiselect on rerun
+                st.session_state.journals_add_nonce += 1
+                st.rerun()
+
+            if clear_results_btn:
+                st.session_state.source_candidates = []
+                st.session_state.journals_add_nonce += 1
+                st.rerun()
+
+        # 2) Show persistent selection and allow removing
+        selected_source_ids: List[str] = []
+        sel_items = sorted(st.session_state.selected_journals.items(), key=lambda x: x[1])
+        if sel_items:
+            st.markdown("**Selected journals (persistent across searches)**")
+            sel_options = [(sid, label) for sid, label in sel_items]
+
+            picked_to_remove = st.multiselect(
+                "Selected journals (select to remove)",
+                options=sel_options,
+                format_func=lambda x: x[1],
+                key=f"journals_remove_multiselect_{st.session_state.journals_remove_nonce}",
+            )
+            col_rm1, col_rm2 = st.columns([1, 1])
+            with col_rm1:
+                rm_btn = st.button("Remove selected", key="journals_remove_btn")
+            with col_rm2:
+                clear_all_btn = st.button("Clear all selected", key="journals_clear_all_btn")
+
+            if rm_btn and picked_to_remove:
+                for sid, _label in picked_to_remove:
+                    st.session_state.selected_journals.pop(sid, None)
+                st.session_state.journals_remove_nonce += 1
+                st.rerun()
+
+            if clear_all_btn:
+                st.session_state.selected_journals = {}
+                st.session_state.journals_remove_nonce += 1
+                st.rerun()
+
+            selected_source_ids = list(st.session_state.selected_journals.keys())
+        else:
+            st.caption("No journals selected yet. Use the search box above and click **Add selected**.")
 
         st.subheader("Subfield filter (OpenAlex taxonomy)")
         subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
@@ -939,11 +1230,12 @@ if df is None or df.empty:
 # ----------------------------
 # Tabs
 # ----------------------------
-tab_preview, tab_growth, tab_impact, tab_chatgpt, tab_download = st.tabs([
+tab_preview, tab_growth, tab_impact, tab_chatgpt, tab_commissioning, tab_download = st.tabs([
     "📄 Preview",
     "🟩 Treemap (Topics growth)",
     "🟧 Treemap (Impact)",
     "🤖 ChatGPT",
+    "🧠 Commissioning",
     "⬇ Download",
 ])
 
@@ -963,6 +1255,13 @@ with tab_preview:
         ys = pd.to_numeric(df["PublicationYear"], errors="coerce")
         c3.metric("Year min", f"{int(ys.min())}" if ys.notna().any() else "—")
         c4.metric("Year max", f"{int(ys.max())}" if ys.notna().any() else "—")
+    
+    st.download_button(
+    label="⬇ Download dataset (CSV)",
+    data=df.to_csv(index=False).encode("utf-8"),
+    file_name=f"openalex_dataset_{len(df)}.csv",
+    mime="text/csv",
+            )
 
 
 with tab_growth:
@@ -1105,123 +1404,244 @@ with tab_chatgpt:
             "ChatGPT enrichment is disabled while 'Data source' is set to **Fetch from OpenAlex**. "
             "Switch to **Upload CSV** or **Use loaded data** first (to avoid accidental large API spend)."
         )
-        st.stop()
-
-    st.caption("Runs on the current loaded dataframe only (uploaded or previously fetched).")
-
-    # --- Controls ---
-    colA, colB, colC = st.columns([1, 1, 1])
-    with colA:
-        openai_api_key = st.text_input("OpenAI API key", value="", type="password")
-    with colB:
-        openai_model = st.text_input("Model", value="gpt-4o-mini")
-    with colC:
-        openai_temp = st.slider("Temperature", 0.0, 1.2, 0.8, 0.1)
-
-    preset = st.selectbox(
-        "Prompt preset",
-        ["Key challenge / Review", "(placeholder) Prompt 2", "(placeholder) Prompt 3", "Write your own"],
-        index=0,
-    )
-
-    PRESET_KEY_CHALLENGE = (
-        "Identify the key challenge in the following text and provide it without any line breaks, "
-        "then insert a line break and on a new line provide a title for a possible review article "
-        "addressing this challenge without any further line breaks.\n\n"
-        "{input_text}"
-    )
-
-    PRESET_2 = (
-        "Provide a one-sentence plain-language summary of the following text (single line, no line breaks).\n\n"
-        "{input_text}"
-    )
-
-    PRESET_3 = (
-        "Suggest three potential applications or implications (single line; separate items with '; ').\n\n"
-        "{input_text}"
-    )
-
-    if preset == "Key challenge / Review":
-        prompt_text = st.text_area("Prompt", value=PRESET_KEY_CHALLENGE, height=140)
-    elif preset == "(placeholder) Prompt 2":
-        prompt_text = st.text_area("Prompt", value=PRESET_2, height=140)
-    elif preset == "(placeholder) Prompt 3":
-        prompt_text = st.text_area("Prompt", value=PRESET_3, height=140)
+        #st.stop()
     else:
-        prompt_text = st.text_area("Prompt", value="", height=140, placeholder="Write your prompt here. Must include {input_text}.")
+        st.caption("Runs on the current loaded dataframe only (uploaded or previously fetched).")
 
-    # What to send
-    input_mode = st.selectbox("Send to ChatGPT", ["Abstract", "Title", "Title + Abstract", "Custom column"], index=0)
-    custom_col = ""
-    if input_mode == "Custom column":
-        text_cols = [c for c in df.columns if c not in ("SPECTER2",) ]
-        custom_col = st.selectbox("Column", options=text_cols, index=0 if text_cols else 0)
+        # --- Controls ---
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            openai_api_key = st.text_input("OpenAI API key", value="", type="password")
+        with colB:
+            openai_model = st.text_input("Model", value="gpt-4o-mini")
+        with colC:
+            openai_temp = st.slider("Temperature", 0.0, 1.2, 0.8, 0.1)
 
-    top_n = st.number_input("Top N records (test)", min_value=1, max_value=500, value=10, step=1)
+        preset = st.selectbox(
+            "Prompt preset",
+            ["Key challenge / Review", "(placeholder) Prompt 2", "(placeholder) Prompt 3", "Write your own"],
+            index=0,
+        )
 
-    run = st.button("Run ChatGPT enrichment", type="primary")
+        PRESET_KEY_CHALLENGE = (
+            "Identify the key challenge in the following text and provide it without any line breaks, "
+            "then insert a line break and on a new line provide a title for a possible review article "
+            "addressing this challenge without any further line breaks.\n\n"
+            "{input_text}"
+        )
 
-    if run:
-        if not openai_api_key.strip():
-            st.error("OpenAI API key is required.")
-        elif not prompt_text.strip() or "{input_text}" not in prompt_text:
-            st.error("Prompt must be non-empty and include the placeholder {input_text}.")
+        PRESET_2 = (
+            "Provide a one-sentence plain-language summary of the following text (single line, no line breaks).\n\n"
+            "{input_text}"
+        )
+
+        PRESET_3 = (
+            "Suggest three potential applications or implications (single line; separate items with '; ').\n\n"
+            "{input_text}"
+        )
+
+        if preset == "Key challenge / Review":
+            prompt_text = st.text_area("Prompt", value=PRESET_KEY_CHALLENGE, height=140)
+        elif preset == "(placeholder) Prompt 2":
+            prompt_text = st.text_area("Prompt", value=PRESET_2, height=140)
+        elif preset == "(placeholder) Prompt 3":
+            prompt_text = st.text_area("Prompt", value=PRESET_3, height=140)
         else:
-            prog = st.progress(0.0)
-            try:
-                df2 = enrich_df_with_chatgpt(
-                    df=df,
-                    top_n=int(top_n),
-                    api_key=openai_api_key.strip(),
-                    model=openai_model.strip(),
-                    temperature=float(openai_temp),
-                    prompt_text=prompt_text,
-                    preset_name=preset if preset != "Write your own" else "Custom",
-                    input_mode=input_mode,
-                    custom_col=custom_col,
-                    progress_cb=prog.progress,
-                )
-                st.session_state.df = df2
-                df = df2
-                st.success(f"ChatGPT enrichment completed for Top {int(top_n)} rows.")
-                ####
-                st.download_button(
-                    label="⬇ Download enriched Top N (CSV)",
-                    data=df.head(int(top_n)).to_csv(index=False).encode("utf-8"),
-                    file_name=f"chatgpt_enriched_top{int(top_n)}.csv",
-                    mime="text/csv",
-                )
-                
-                ####
+            prompt_text = st.text_area("Prompt", value="", height=140, placeholder="Write your prompt here. Must include {input_text}.")
 
-                # --- Show results immediately in the UI ---
-                st.markdown("### Preview of enriched rows (Top N)")
+        # What to send
+        input_mode = st.selectbox("Send to ChatGPT", ["Abstract", "Title", "Title + Abstract", "Custom column"], index=0)
+        custom_col = ""
+        if input_mode == "Custom column":
+            text_cols = [c for c in df.columns if c not in ("SPECTER2",) ]
+            custom_col = st.selectbox("Column", options=text_cols, index=0 if text_cols else 0)
 
-                if preset == "Key challenge / Review":
-                    show_cols = [
-                        c for c in [
-                            "DOI", "Title", "Article Title",
-                            "Key challenge identified by ChatGPT",
-                            "Possible Review Article Title suggested by ChatGPT"
+        top_n = st.number_input("Top N records (test)", min_value=1, max_value=500, value=10, step=1)
+
+        run = st.button("Run ChatGPT enrichment", type="primary")
+
+        if run:
+            if not openai_api_key.strip():
+                st.error("OpenAI API key is required.")
+            elif not prompt_text.strip() or "{input_text}" not in prompt_text:
+                st.error("Prompt must be non-empty and include the placeholder {input_text}.")
+            else:
+                prog = st.progress(0.0)
+                try:
+                    df2 = enrich_df_with_chatgpt(
+                        df=df,
+                        top_n=int(top_n),
+                        api_key=openai_api_key.strip(),
+                        model=openai_model.strip(),
+                        temperature=float(openai_temp),
+                        prompt_text=prompt_text,
+                        preset_name=preset if preset != "Write your own" else "Custom",
+                        input_mode=input_mode,
+                        custom_col=custom_col,
+                        progress_cb=prog.progress,
+                    )
+                    st.session_state.df = df2
+                    df = df2
+                    st.success(f"ChatGPT enrichment completed for Top {int(top_n)} rows.")
+                    ####
+                    st.download_button(
+                        label="⬇ Download enriched Top N (CSV)",
+                        data=df.head(int(top_n)).to_csv(index=False).encode("utf-8"),
+                        file_name=f"chatgpt_enriched_top{int(top_n)}.csv",
+                        mime="text/csv",
+                    )
+                    
+                    ####
+
+                    # --- Show results immediately in the UI ---
+                    st.markdown("### Preview of enriched rows (Top N)")
+
+                    if preset == "Key challenge / Review":
+                        show_cols = [
+                            c for c in [
+                                "DOI", "Title", "Article Title",
+                                "Key challenge identified by ChatGPT",
+                                "Possible Review Article Title suggested by ChatGPT"
+                            ]
+                            if c in df.columns
                         ]
-                        if c in df.columns
-                    ]
-                else:
-                    out_col = f"ChatGPT output ({preset if preset != 'Write your own' else 'Custom'})"
-                    show_cols = [c for c in ["DOI", "Title", "Article Title", out_col] if c in df.columns]
+                    else:
+                        out_col = f"ChatGPT output ({preset if preset != 'Write your own' else 'Custom'})"
+                        show_cols = [c for c in ["DOI", "Title", "Article Title", out_col] if c in df.columns]
 
-                st.dataframe(df.head(int(top_n))[show_cols], use_container_width=True)
-                ###
-                with st.expander("Show input text used for the first enriched record"):
-                    st.write(build_input_text_from_row(df.iloc[0], mode=input_mode, custom_col=custom_col))
-                ###
+                    st.dataframe(df.head(int(top_n))[show_cols], use_container_width=True)
+                    ###
+                    with st.expander("Show input text used for the first enriched record"):
+                        st.write(build_input_text_from_row(df.iloc[0], mode=input_mode, custom_col=custom_col))
+                    ###
 
-            except Exception as e:
-                st.error(f"ChatGPT enrichment failed: {e}")
-            finally:
-                prog.empty()
+                except Exception as e:
+                    st.error(f"ChatGPT enrichment failed: {e}")
+                finally:
+                    prog.empty()
+
+
+
+with tab_commissioning:
+    st.subheader("Commissioning: propose review topics from a selected group")
+    st.caption("Select a grouping column + values, then generate review-topic proposals supported by multiple papers.")
+
+    # Safety: do not allow model calls while fetching from OpenAlex
+    if 'data_source' in globals() and data_source == "Fetch from OpenAlex":
+        st.warning(
+            "Commissioning is disabled while 'Data source' is set to **Fetch from OpenAlex**. "
+            "Switch to **Upload CSV** or **Use loaded data** first (to avoid accidental large API spend)."
+        )
+        #st.stop()
+    else:
+        # --- Inputs ---
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            openai_api_key_c = st.text_input("OpenAI API key", value="", type="password", key="oa_key_comm")
+        with col2:
+            openai_model_c = st.text_input("Model", value="gpt-4o-mini", key="oa_model_comm")
+        with col3:
+            openai_temp_c = st.slider("Temperature", 0.0, 1.2, 0.3, 0.1, key="oa_temp_comm")
+
+        # Choose grouping/cluster column
+        candidate_cols = [c for c in df.columns if c not in ("Abstract", "SPECTER2")]
+        cluster_col = st.selectbox("Grouping / clustering column", options=candidate_cols, index=0, key="comm_cluster_col")
+
+        # Values from that column
+        vals = df[cluster_col].dropna().unique().tolist() if cluster_col in df.columns else []
+        # Sort for display (safe)
+        try:
+            vals = sorted(vals, key=lambda x: str(x))
+        except Exception:
+            vals = [str(x) for x in vals]
+
+        cluster_values = st.multiselect("Select value(s) to include", options=vals, default=vals[:1] if vals else [], key="comm_cluster_vals")
+
+        # What to send
+        input_mode = st.selectbox("Send to model", ["Title", "Abstract", "Title + Abstract", "Custom column"], index=2, key="comm_input_mode")
+        custom_col = ""
+        if input_mode == "Custom column":
+            custom_col = st.selectbox("Custom column", options=list(df.columns), index=0, key="comm_custom_col")
+
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            max_papers = st.number_input("Max papers to include (sample)", min_value=5, max_value=200, value=30, step=5, key="comm_max_papers")
+        with colB:
+            min_support = st.number_input("Min supporting papers per topic", min_value=2, max_value=10, value=2, step=1, key="comm_min_support")
+        with colC:
+            show_raw = st.checkbox("Show raw model output", value=False, key="comm_show_raw")
+
+        run_comm = st.button("Generate review topics", type="primary", key="comm_run")
+
+        if run_comm:
+            if not openai_api_key_c.strip():
+                st.error("OpenAI API key is required.")
+            elif not cluster_values:
+                st.error("Select at least one value in the grouping column.")
+            else:
+                prog = st.progress(0.0)
+                try:
+                    topics_df, support_df, raw = commissioning_run(
+                        df=df,
+                        cluster_col=cluster_col,
+                        cluster_values=cluster_values,
+                        max_papers=int(max_papers),
+                        input_mode=input_mode,
+                        custom_col=custom_col,
+                        min_support=int(min_support),
+                        api_key=openai_api_key_c.strip(),
+                        model=openai_model_c.strip(),
+                        temperature=float(openai_temp_c),
+                        progress_cb=prog.progress,
+                    )
+
+                    st.session_state["commissioning_topics_df"] = topics_df
+                    st.session_state["commissioning_support_df"] = support_df
+                    st.session_state["commissioning_raw"] = raw
+
+                    if topics_df is None or topics_df.empty:
+                        st.warning("No topics parsed from model output (or output wasn't valid JSON).")
+                    else:
+                        st.success(f"Generated {len(topics_df)} proposed review topics.")
+
+                except Exception as e:
+                    st.error(f"Commissioning run failed: {e}")
+                finally:
+                    prog.empty()
+
+        # Display latest results if present
+        topics_df = st.session_state.get("commissioning_topics_df")
+        support_df = st.session_state.get("commissioning_support_df")
+
+        if isinstance(topics_df, pd.DataFrame) and not topics_df.empty:
+            st.markdown("### Proposed review topics")
+            st.dataframe(topics_df, use_container_width=True)
+
+            st.download_button(
+                "⬇ Download review topics (CSV)",
+                data=topics_df.to_csv(index=False).encode("utf-8"),
+                file_name="commissioning_review_topics.csv",
+                mime="text/csv",
+            )
+
+        if isinstance(support_df, pd.DataFrame) and not support_df.empty:
+            st.markdown("### Topic → supporting papers")
+            st.dataframe(support_df, use_container_width=True)
+            st.download_button(
+                "⬇ Download topic-to-papers mapping (CSV)",
+                data=support_df.to_csv(index=False).encode("utf-8"),
+                file_name="commissioning_topic_to_papers.csv",
+                mime="text/csv",
+            )
+
+        if show_raw:
+            raw = st.session_state.get("commissioning_raw", "")
+            if raw:
+                st.markdown("### Raw model output")
+                st.code(raw)
 
 with tab_download:
+    st.caption("DEBUG BUILD: fernet_journalsAccum_v3 — 2026-05-19 09:xx")
     st.subheader("Download")
     st.download_button(
         label="Download CSV",
