@@ -1,8 +1,7 @@
 
-###continue with this verison; the next thing to do: sampling/randomization
+# This is _negroni . It's simply copied stSearchDashOpenAlex_martini_with_olive_deployed_Copilot.py
+# ###continue with this verison; the next thing to do: sampling/randomization
 
-# This _negroni is simply copied stSearchDashOpenAlex_martini_with_olive_deployed_Copilot.py
-# 
 # Ask copilot for my todos and bookmarks and my genius idea (instead of target journal, v.v.)
 
 ## I need to "explode" the 3 topics and add a possibility to commission based on them
