@@ -1121,8 +1121,8 @@ def commissioning_run(
     support_df = pd.DataFrame(support_rows)
     return topics_df, support_df, raw
 
-st.set_page_config(page_title="Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)", layout="wide")
-st.title("Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)")
+st.set_page_config(page_title="Lucie's OpenAlex Dashboard Sandbox (Negroni w/ olive 🍸)", layout="wide")
+st.title("Lucie's OpenAlex Dashboard Sandbox (Negroni w/ olive 🍸)")
 st.warning(
     "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
     "Please avoid fetching tens of thousands of records in one go without an API key. We do not want to get blocked."
