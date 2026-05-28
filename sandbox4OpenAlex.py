@@ -1,3 +1,28 @@
+## I need to "explode" the 3 topics and add a possibility to commission based on them
+## add possibility to generate keywords
+### add "my" heatmaps
+
+# I changed 
+# BATCH = 500 --> BATCH = 200
+# I set specter max rows to embed to 6000 from 5000 while doing the Adv Sci test
+
+# note about COUNTRIES
+# Because OpenAlex only returns up to the first 100 authorships in the work object, the “all authors from selected countries” mode
+# #is limited by what OpenAlex returns in authorships. The docs state that authorships is limited to the first 100 authors for API performance.
+
+### I have now enabled SPECTER - in 4 lines around 1235 (numbering in _iceberg) - just flip i to TRUE again to lock it
+
+ #      # SPECTER2 toggle (disabled for now)
+ #       st.subheader("Embeddings (optional)")
+ #       fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=False)
+ #       s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=False)
+ #       max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=False)
+ #       s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=False)
+
+
+#I need to add slicing by journal and the “other topics” and best also by any column –> to be now able to go to commissioning tab and filter out “Nature Cell etc”
+
+# copied _gin and renamed to _iceberg for including Primary Topic filtering manually as Copilot keeps screwing up
 # _gin is renamed stSearchDashOpenAlex_fernet_journalsAccum_v4_nostop - Copy.py
 # in _fernet I added proper multiselect for journals - even though it's not very intuitive. I shall improve it.
 # Then the disappearing button was patched --> _gin
@@ -99,6 +124,36 @@ def fetch_all_subfields(api_key: str = "", mailto: str = "") -> pd.DataFrame:
 # ----------------------------
 # Helpers
 # ----------------------------
+
+def save_country_labels():
+            st.session_state.country_labels_saved = st.session_state._country_labels
+
+TOPICS_URL = "https://api.openalex.org/topics"
+
+def search_topics(query: str, api_key: str = "", mailto: str = "", max_results: int = 15) -> List[Dict[str, Any]]:
+    if not query.strip():
+        return []
+
+    params = {
+        "search": query,
+        "per-page": max_results
+    }
+
+    if mailto:
+        params["mailto"] = mailto
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        r = requests.get(TOPICS_URL, params=params, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("results", [])
+    except Exception:
+        return []
+
 
 def invert_index_to_text(inv: Optional[Dict[str, List[int]]]) -> str:
     """Reconstruct abstract text from OpenAlex abstract_inverted_index."""
@@ -206,7 +261,7 @@ def s2_fetch_specter2_embeddings(s2_ids: list[str], s2_api_key: str = "", sleep_
     # Request full embedding object and extract SPECTER2 vector robustly.
     fields = "paperId,corpusId,embedding"
 
-    BATCH = 500
+    BATCH = 200
     for i in range(0, len(s2_ids), BATCH):
         chunk = s2_ids[i:i + BATCH]
         r = requests.post(
@@ -454,6 +509,11 @@ def build_works_params(
     per_page: int,
     source_ids: Optional[List[str]] = None,
     subfield_id: Optional[str] = None,
+    #primary_topic_id: Optional[str] = None,  # ✅ NEW in _iceberg
+    primary_topic_ids: Optional[List[str]] = None,
+    work_types: Optional[List[str]] = None,
+    countries: Optional[List[str]] = None,
+    #country_mode: str = "Any author (default)",
     require_abstract: bool = True,
     require_doi: bool = True,
     include_xpac: bool = True,
@@ -463,7 +523,8 @@ def build_works_params(
         filters.append("has_doi:true")
     if require_abstract:
         filters.append("has_abstract:true")
-
+    
+    
     # publication_year filtering (GUI-consistent)
     if year_from is not None and year_to is not None:
         filters.append(f"publication_year:{int(year_from)}-{int(year_to)}")
@@ -476,9 +537,29 @@ def build_works_params(
         sources_val = "|".join([sid for sid in source_ids if sid])
         if sources_val:
             filters.append(f"primary_location.source.id:{sources_val}")
+    
+    # --- Work type ---
+    if work_types:
+        filters.append(f"type:{'|'.join(work_types)}")
+
+    # --- Country (first author / affiliation workaround) ---
+    # --- Country (API-level only for default mode) ---
+    #if countries and country_mode == "Any author (default)":
+    #    filters.append(f"authorships.institutions.country_code:{'|'.join(countries)}")
+    if countries:
+        filters.append(f"authorships.institutions.country_code:{'|'.join(countries)}")
+        
+
 
     if subfield_id:
         filters.append(f"primary_topic.subfield.id:{subfield_id}")
+
+    #if primary_topic_id:
+    #    filters.append(f"primary_topic.id:{primary_topic_id}")   # ✅ NEW in _iceberg
+
+    if primary_topic_ids:
+        joined = "|".join(primary_topic_ids)
+        filters.append(f"primary_topic.id:{joined}")
 
     params: Dict[str, Any] = {
         "filter": ",".join(filters),
@@ -489,6 +570,7 @@ def build_works_params(
             "doi",
             "display_name",
             "abstract_inverted_index",
+            "authorships",
             "primary_topic",
             "topics",
             "publication_year",
@@ -525,6 +607,10 @@ def fetch_works(
     sleep_s: float,
     source_ids: Optional[List[str]] = None,
     subfield_id: Optional[str] = None,
+    primary_topic_ids: Optional[List[str]] = None,
+    work_types: Optional[List[str]] = None,
+    countries: Optional[List[str]] = None,
+    #country_mode: str = "Any author (default)",
     require_abstract: bool = True,
     require_doi: bool = True,
     include_xpac: bool = True,
@@ -554,6 +640,13 @@ def fetch_works(
             per_page=200,
             source_ids=source_ids,
             subfield_id=subfield_id,
+            #primary_topic_id=primary_topic_id,
+            primary_topic_ids=primary_topic_ids,
+
+            work_types=work_types,
+            #country_mode=country_mode,
+            countries=countries,
+
             require_abstract=require_abstract,
             require_doi=require_doi,
             include_xpac=include_xpac,
@@ -584,11 +677,46 @@ def fetch_works(
                 continue
             if require_abstract and not abstract:
                 continue
+            
+            country_codes = []
+            for auth in (w.get("authorships") or []):
+                for inst in (auth.get("institutions") or []):
+                    cc = inst.get("country_code")
+                    if cc:
+                        country_codes.append(cc)
+
+            country_codes = sorted(set(country_codes))
+            country_str = "; ".join(country_codes)
+
+            selected_countries = set(countries or [])
+
+            corresponding_country_codes = []
+            all_author_country_codes = []
+
+            for auth in (w.get("authorships") or []):
+                auth_inst_codes = []
+                for inst in (auth.get("institutions") or []):
+                    cc = inst.get("country_code")
+                    if cc:
+                        auth_inst_codes.append(cc)
+                        all_author_country_codes.append(cc)
+
+                if auth.get("is_corresponding"):
+                    corresponding_country_codes.extend(auth_inst_codes)
+
+            all_author_country_codes = sorted(set(all_author_country_codes))
+            corresponding_country_codes = sorted(set(corresponding_country_codes))
+
+           
+
+
 
             row = {
                 "DOI": doi,
                 "Title": title,
                 "Abstract": abstract or "",
+                "Country": country_str,
+                "CorrespondingAuthorCountry": "; ".join(corresponding_country_codes),
                 "PublicationYear": w.get("publication_year"),
                 "PublicationDate": w.get("publication_date"),
                 "JournalOrVenue": safe_get_journal_from_primary_location(w),
@@ -987,7 +1115,7 @@ def commissioning_run(
     support_df = pd.DataFrame(support_rows)
     return topics_df, support_df, raw
 
-st.set_page_config(page_title="Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)", layout="wide")
+st.set_page_config(page_title="Lucie's OpenAlex Search + Dashboard Sandbox (martini w/ olive 🍸)", layout="wide")
 st.title("Lucie's OpenAlex Search + Dashboard Sandbox (espresso v2)")
 st.warning(
     "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
@@ -1022,6 +1150,104 @@ with st.sidebar:
         st.subheader("Query")
         keyword_query = st.text_area("Keyword / phrase query (Boolean allowed; can be empty)", value="", height=70)
 
+        st.markdown("### Work type")
+
+        work_types = st.multiselect(
+            "Select work type(s)",
+           options=[
+                "article",
+                "book",
+                "book-chapter",
+                "dataset",
+                "dissertation",
+                "editorial",
+                "erratum",
+                "letter",
+                "libguides",
+                "other",
+                "paratext",
+                "peer-review",
+                "preprint",
+                "reference-entry",
+                "report",
+                "retraction",
+                "review",
+                "standard",
+                "supplementary-materials",
+            ],
+            default=["article"],  # ✅ keeps reviews OUT by default
+            key="work_types"
+        )
+
+        st.markdown("### Country filter")
+
+       # --- Country list (ISO2 → name) ---
+        COUNTRIES = {
+            "US": "United States",
+            "GB": "United Kingdom",
+            "DE": "Germany",
+            "FR": "France",
+            "IT": "Italy",
+            "ES": "Spain",
+            "CA": "Canada",
+            "AU": "Australia",
+            "NL": "Netherlands",
+            "BE": "Belgium",
+            "CH": "Switzerland",
+            "AT": "Austria",
+            "SE": "Sweden",
+            "NO": "Norway",
+            "DK": "Denmark",
+            "FI": "Finland",
+            "IE": "Ireland",
+            "PT": "Portugal",
+            "PL": "Poland",
+            "CZ": "Czech Republic",
+            "HU": "Hungary",
+            "RO": "Romania",
+            "GR": "Greece",
+            "TR": "Turkey",
+            "CN": "China",
+            "JP": "Japan",
+            "KR": "South Korea",
+            "IN": "India",
+            "BR": "Brazil",
+            "MX": "Mexico",
+            "ZA": "South Africa",
+            "SG": "Singapore",
+            "HK": "Hong Kong",
+            "TW": "Taiwan",
+            "NZ": "New Zealand",
+        }
+
+        st.caption("Filter includes works with at least one author affiliated with selected country")
+        
+        if "country_labels_saved" not in st.session_state:
+                    st.session_state.country_labels_saved = []
+      
+        #_country_labels = widget key (ephemeral / tied to rendering)
+        #country_labels_saved = persistent app state (survives when widget disappears
+        country_labels = st.multiselect(
+            "Select country/countries",
+            options=[f"{name} ({code})" for code, name in COUNTRIES.items()],
+            key="_country_labels",
+            default=st.session_state.country_labels_saved,
+            on_change=save_country_labels,
+        )
+
+
+        # convert back to ISO2 codes
+        countries = [label.split("(")[-1].strip(")") for label in country_labels]
+        ## ✅ use widget if available, fallback to session_state otherwise
+        #if country_labels:
+        #    countries = [label.split("(")[-1].strip(")") for label in country_labels]
+        #else:
+        #    country_labels = st.session_state.get("country_labels", [])
+        #    countries = [label.split("(")[-1].strip(")") for label in country_labels]
+
+
+
+
         st.subheader("Journal filter")
         journal_lookup = st.text_input('Journal lookup (e.g., "Nature")', value="")
         find_journals = st.button("Find journals")
@@ -1040,6 +1266,22 @@ with st.sidebar:
             st.session_state.journals_add_nonce = 0
         if "journals_remove_nonce" not in st.session_state:
             st.session_state.journals_remove_nonce = 0
+
+        ##### Adding in _JungleBird
+        # --- Topic basket state ---
+        if "topic_basket" not in st.session_state:
+            st.session_state.topic_basket = {}  # {id: label}
+
+        #if "topic_applied_ids" not in st.session_state:
+        #    st.session_state.topic_applied_ids = []
+
+        #if "topic_filter_applied" not in st.session_state:
+        #    st.session_state.topic_filter_applied = False
+        
+        #### end addition
+
+               
+
 
         if find_journals:
             try:
@@ -1137,6 +1379,123 @@ with st.sidebar:
         if subfield_choice != "(none)" and not subfields_df.empty:
             subfield_id = subfields_df.loc[subfields_df["label"] == subfield_choice, "subfield_id"].iloc[0]
 
+        #### new in _iceberg: Primary Topic filter
+        #st.markdown("### Primary Topic filter (OpenAlex ID)")
+
+        st.markdown("### Primary Topic filter")
+
+        topic_query = st.text_input(
+            "Search Primary Topic",
+            placeholder="Type e.g. proteomics, CRISPR, metabolomics...",
+        )
+
+        topic_results = []
+        topic_options = {}
+
+        if topic_query.strip():
+            topic_results = search_topics(topic_query, api_key=api_key, mailto=mailto)
+
+            for t in topic_results:
+                name = t.get("display_name", "Unknown")
+                tid = (t.get("id") or "").split("/")[-1]
+
+                label = f"{name} ({tid})"
+                topic_options[label] = tid
+
+        selected_topic_labels = st.multiselect(
+            "Select Primary Topic(s)",
+            options=list(topic_options.keys()),
+        )
+
+        ################ Adding in _JungleBird
+        # --- build label → ID mapping (reuse your existing logic) ---
+        topic_options = {}
+        for t in topic_results:
+            name = t.get("display_name", "Unknown")
+            tid = (t.get("id") or "").split("/")[-1]
+            if tid:
+                label = f"{name} ({tid})"
+                topic_options[label] = tid
+
+        # convert current selection → IDs
+        current_selected_ids = [
+            topic_options[label] for label in selected_topic_labels
+        ] if selected_topic_labels else []
+
+
+        # --- buttons ---
+        colA, colB = st.columns(2)
+
+        with colA:
+            add_clicked = st.button("➕ Add to basket", use_container_width=True)
+
+       # with colB:
+       #     apply_clicked = st.button("✅ Apply to search", use_container_width=True)
+
+
+        # --- add to basket ---
+        if add_clicked and current_selected_ids:
+            for label in selected_topic_labels:
+                tid = topic_options[label]
+                st.session_state.topic_basket[tid] = label  # dedupe by ID
+            
+            ### adding fix after patches 
+        # 🚨 IMPORTANT: invalidate previous applied state
+          #  st.session_state.topic_filter_applied = False
+
+
+
+        # --- apply basket ---
+        #if apply_clicked:
+        #    st.session_state.topic_applied_ids = list(st.session_state.topic_basket.keys())
+        #    st.session_state.topic_filter_applied = True
+
+        ############### end patch 2
+
+        ### Fix 1 after patches 1-4
+        # --- status feedback ---
+       # if st.session_state.topic_filter_applied:
+       #     st.success(f"✅ Topic filter ACTIVE ({len(st.session_state.topic_applied_ids)} topics)")
+       # else:
+       #     st.warning("⚠️ Topic filter NOT applied yet — click 'Apply topics' before Fetch")
+
+            ### end fix
+
+        #### 
+        st.caption(f"Selected topics in basket: {len(st.session_state.topic_basket)}")
+
+        # --- Topic basket display ---
+        if st.session_state.topic_basket:
+            st.write(list(st.session_state.topic_basket.values()))
+
+            if st.button("🧹 Clear basket"):
+                st.session_state.topic_basket = {}
+                st.rerun()
+
+        # status
+        if st.session_state.topic_basket:
+            st.info(f"🎯 Filtering by {len(st.session_state.topic_basket)} topic(s)")
+        else:
+            st.info("No Primary Topic filter applied")
+
+        ##### Replacing this with Patch 4
+
+
+        
+        primary_topic_ids = (
+            list(st.session_state.topic_basket.keys())
+            if st.session_state.topic_basket
+            else None
+        )
+
+
+        if st.session_state.topic_basket:
+            st.info(f"🎯 Topic filter ACTIVE ({len(st.session_state.topic_basket)} topics)")
+        else:
+            st.info("No Primary Topic filter applied")
+
+        ####
+
         st.subheader("Year range")
         year_from_val, year_to_val = st.slider("Publication years", min_value=1900, max_value=2100, value=(2023, 2025), step=1)
 
@@ -1153,17 +1512,20 @@ with st.sidebar:
         cite_year_from = st.number_input("Cite year from", 1900, 2100, 2017)
         cite_year_to = st.number_input("Cite year to", 1900, 2100, 2025)
 
-        # SPECTER2 toggle (disabled for now)
+        # ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️SPECTER2 toggle (disabled for now) ⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️⚠️
         st.subheader("Embeddings (optional)")
         fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=True)
         s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=True)
-        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=5000, value=200, step=50, disabled=True)
+        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=True)
         s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=True)
 
         st.subheader("Politeness")
         sleep_s = st.slider("Sleep between OpenAlex requests (s)", 0.0, 1.0, 0.2, 0.05)
 
         go = st.button("Fetch dataset", type="primary")
+
+        #if st.session_state.topic_basket and not st.session_state.topic_filter_applied:
+        #    st.warning("⚠️ Basket contains topics but filter NOT applied")
 
 # Session storage
 if "df" not in st.session_state:
@@ -1184,6 +1546,12 @@ if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
     progress = st.progress(0.0)
     status = st.empty()
 
+    primary_topic_ids = (
+        list(st.session_state.topic_basket.keys())
+        if st.session_state.topic_basket
+        else None
+    )
+
     try:
         with st.spinner("Querying OpenAlex…"):
             df = fetch_works(
@@ -1196,6 +1564,8 @@ if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
                 sleep_s=float(sleep_s),
                 source_ids=selected_source_ids or None,
                 subfield_id=subfield_id,
+                #primary_topic_id=primary_topic_id.strip() or None,
+                primary_topic_ids=primary_topic_ids,
                 require_abstract=require_abstract,
                 require_doi=require_doi,
                 include_xpac=include_xpac,
@@ -1205,6 +1575,10 @@ if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
                 s2_api_key=s2_api_key,
                 max_embed_rows=int(max_embed_rows),
                 s2_sleep_s=float(s2_sleep_s),
+                work_types=work_types,          # ✅ ADDED
+                #country_mode=country_mode,
+                countries=countries             # ✅ ADDED
+
             )
 
             if include_citations_by_year:
@@ -1221,7 +1595,24 @@ if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
         status.error(f"Error: {e}")
 
 
-df = st.session_state.df
+#df = st.session_state.df
+#df_raw = st.session_state.df
+#df = df_raw.copy()
+
+df_raw = st.session_state.df
+
+if df_raw is not None:
+    df = df_raw.copy()
+else:
+    df = None
+
+country_labels = st.session_state.country_labels_saved
+countries = [label.split("(")[-1].strip(")") for label in country_labels]
+
+country_mode = st.session_state.get("country_mode", "Any author (default)")
+
+#country_mode = "Any author (default)"   # ✅ safe default
+#countries = []
 
 if df is None or df.empty:
     st.info("No dataset loaded yet. Fetch from OpenAlex or upload a CSV.")
@@ -1231,7 +1622,7 @@ if df is None or df.empty:
 # Tabs
 # ----------------------------
 tab_preview, tab_growth, tab_impact, tab_chatgpt, tab_commissioning, tab_download = st.tabs([
-    "📄 Preview",
+    "📄 Loaded data",
     "🟩 Treemap (Topics growth)",
     "🟧 Treemap (Impact)",
     "🤖 ChatGPT",
@@ -1241,20 +1632,90 @@ tab_preview, tab_growth, tab_impact, tab_chatgpt, tab_commissioning, tab_downloa
 
 with tab_preview:
     st.subheader("Preview")
+
+    st.markdown("### Country mode")
+
+    st.caption("Controls how country filter is applied to authorships")
+        
+    country_mode = st.radio(
+            "How should country filter be applied?",
+            options=[
+                "Any author (default)",
+                "Corresponding author only",
+                "All authors from selected countries"
+            ],
+            index=0,
+            key="country_mode" 
+        )
+
+
+    #df_filtered = df   # ✅ NEW LINE
+
+    # --- APPLY COUNTRY MODE FILTER ---
+    if df is not None and not df.empty and len(countries) > 0 and country_mode != "Any author (default)":
+
+        selected = set(countries)
+
+        if country_mode == "Corresponding author only":
+            df = df[
+                df["CorrespondingAuthorCountry"]
+                .fillna("")
+                .apply(lambda s: bool(set([x.strip() for x in s.split(";") if x.strip()]) & selected))
+            ].copy()
+
+        elif country_mode == "All authors from selected countries":
+            df = df[
+                df["Country"]
+                .fillna("")
+                .apply(
+                    lambda s: (
+                        len([x.strip() for x in s.split(";") if x.strip()]) > 0 and
+                        set([x.strip() for x in s.split(";") if x.strip()]).issubset(selected)
+                    )
+                )
+            ].copy()
+
+       
+
+    # ✅ SHOW FILTERED DATA
+    #st.dataframe(df_filtered.head(50), use_container_width=True)
+
     st.dataframe(df.head(50), use_container_width=True)
 
     if "Abstract" in df.columns:
         abs_cov = (df["Abstract"].fillna("").astype(str).str.strip().str.len() > 0).mean()
         st.caption(f"Abstract coverage: {abs_cov:.1%}")
 
-    # Quick stats
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(df):,}")
-    c2.metric("Unique DOIs", f"{df['DOI'].nunique():,}" if "DOI" in df.columns else "—")
-    if "PublicationYear" in df.columns:
-        ys = pd.to_numeric(df["PublicationYear"], errors="coerce")
-        c3.metric("Year min", f"{int(ys.min())}" if ys.notna().any() else "—")
-        c4.metric("Year max", f"{int(ys.max())}" if ys.notna().any() else "—")
+    # --- FULL DATASET STATS ---
+    if df_raw is not None:
+
+        st.markdown("**Full dataset**")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Rows", f"{len(df_raw):,}")
+        c2.metric("Unique DOIs", f"{df_raw['DOI'].nunique():,}" if "DOI" in df_raw.columns else "—")
+
+        if "PublicationYear" in df_raw.columns:
+            ys = pd.to_numeric(df_raw["PublicationYear"], errors="coerce")
+            c3.metric("Year min", f"{int(ys.min())}" if ys.notna().any() else "—")
+            c4.metric("Year max", f"{int(ys.max())}" if ys.notna().any() else "—")
+
+    # --- FILTERED DATASET STATS ---
+    if df is not None:
+
+        st.markdown("**Filtered dataset**")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Rows", f"{len(df):,}")
+        c2.metric("Unique DOIs", f"{df['DOI'].nunique():,}" if "DOI" in df.columns else "—")
+
+        if "PublicationYear" in df.columns:
+            ys = pd.to_numeric(df["PublicationYear"], errors="coerce")
+
+
+      
     
     st.download_button(
     label="⬇ Download dataset (CSV)",
