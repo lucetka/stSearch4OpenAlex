@@ -95,7 +95,11 @@ def fetch_all_subfields(api_key: str = "", mailto: str = "") -> pd.DataFrame:
             params["mailto"] = mailto
 
         r = session.get(SUBFIELDS_URL, params=params, timeout=60)
-        r.raise_for_status()
+        #r.raise_for_status()
+        if not r.ok:
+            st.write("SUBFIELDS STATUS:", r.status_code)
+            st.write(r.text[:2000])
+            r.raise_for_status()
         data = r.json()
         results = data.get("results", [])
         if not results:
