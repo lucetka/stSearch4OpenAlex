@@ -1379,7 +1379,20 @@ with st.sidebar:
             st.caption("No journals selected yet. Use the search box above and click **Add selected**.")
 
         st.subheader("Subfield filter (OpenAlex taxonomy)")
-        subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
+        #subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
+     
+        try:
+            subfields_df = fetch_all_subfields(
+                api_key=api_key,
+                mailto=mailto
+            )
+        except Exception as e:
+            st.warning(
+                f"OpenAlex subfield taxonomy unavailable ({e}). "
+                "Subfield filtering disabled."
+            )
+            subfields_df = pd.DataFrame(columns=["label", "subfield_id"])
+         
         subfield_choice = st.selectbox(
             "Subfield (3rd level) — optional",
             options=["(none)"] + (subfields_df["label"].tolist() if not subfields_df.empty else []),
