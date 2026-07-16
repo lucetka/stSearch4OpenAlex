@@ -1750,10 +1750,10 @@ with st.sidebar:
 
         # SPECTER2 toggle (disabled for now)
         st.subheader("Embeddings (optional)")
-        fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=False)
-        s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=False)
-        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=False)
-        s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=False)
+        fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=True)
+        s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=True)
+        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=True)
+        s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=True)
 
         st.subheader("Politeness")
         sleep_s = st.slider("Sleep between OpenAlex requests (s)", 0.0, 1.0, 0.2, 0.05)
