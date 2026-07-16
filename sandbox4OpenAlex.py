@@ -2,6 +2,7 @@
 # _PinaColada is simply copied stSearchDashOpenAlex_ouzo_enrichment_bubble.py, and I manually added the subfield handling errors from _github9Jul2026.py
 # and then saved AS PinaColada_ and then renamed
 
+# This is stSearchDashOpenAlex_ouzo_enrichment_bubble.py complemented with the edits to handle field loading errors from the version edited directly in GitHub downloaded as sandbox4OpenAlex_github9Jul2026.py
 
 ###continue with this verison; the next thing to do: sampling/randomization
 
@@ -115,7 +116,11 @@ def fetch_all_subfields(api_key: str = "", mailto: str = "") -> pd.DataFrame:
         except Exception:
             pass
 
-        r.raise_for_status()
+        #r.raise_for_status()
+        if not r.ok:
+            st.write("SUBFIELDS STATUS:", r.status_code)
+            st.write(r.text[:2000])
+            r.raise_for_status()
         data = r.json()
         results = data.get("results", [])
         if not results:
@@ -1320,7 +1325,7 @@ def commissioning_run(
     return topics_df, support_df, raw
 
 st.set_page_config(page_title="Lucie's OpenAlex Dashboard Sandbox (Negroni w/ olive 🍸)", layout="wide")
-st.title("Lucie's OpenAlex Dashboard Sandbox (Negroni w/ olive 🍸)")
+st.title("Lucie's OpenAlex Dashboard Sandbox (Piña Colada🍍🥥🍹)")
 #st.warning(
 #    "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
 #    "Please avoid fetching tens of thousands of records in one go without an API key. We do not want to get blocked."
@@ -1589,7 +1594,18 @@ with st.sidebar:
             st.caption("No journals selected yet. Use the search box above and click **Add selected**.")
 
         st.subheader("Subfield filter (OpenAlex taxonomy)")
-        subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
+        #subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
+        try:
+            subfields_df = fetch_all_subfields(
+                api_key=api_key,
+                mailto=mailto
+            )
+        except Exception as e:
+            st.warning(
+                f"OpenAlex subfield taxonomy unavailable ({e}). "
+                "Subfield filtering disabled."
+            )
+            subfields_df = pd.DataFrame(columns=["label", "subfield_id"])
         subfield_choice = st.selectbox(
             "Subfield (3rd level) — optional",
             options=["(none)"] + (subfields_df["label"].tolist() if not subfields_df.empty else []),
@@ -1734,10 +1750,10 @@ with st.sidebar:
 
         # SPECTER2 toggle (disabled for now)
         st.subheader("Embeddings (optional)")
-        fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=True)
-        s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=True)
-        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=True)
-        s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=True)
+        fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=False)
+        s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=False)
+        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=False)
+        s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=False)
 
         st.subheader("Politeness")
         sleep_s = st.slider("Sleep between OpenAlex requests (s)", 0.0, 1.0, 0.2, 0.05)
