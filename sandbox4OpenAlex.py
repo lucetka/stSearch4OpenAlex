@@ -1,12 +1,19 @@
+# This is _PinaColada with SPECTER2 embeddings fetching disabled only here on github
+# _PinaColada is simply copied stSearchDashOpenAlex_ouzo_enrichment_bubble.py, and I manually added the subfield handling errors from _github9Jul2026.py
+# and then saved AS PinaColada_ and then renamed
 
-# This is _negroni . It's simply copied stSearchDashOpenAlex_martini_with_olive_deployed_Copilot.py
-# ###continue with this verison; the next thing to do: sampling/randomization
 
-# Ask copilot for my todos and bookmarks and my genius idea (instead of target journal, v.v.)
+###continue with this verison; the next thing to do: sampling/randomization
+
+# This _negroni is simply copied stSearchDashOpenAlex_martini_with_olive_deployed_Copilot.py
+# 
+# Ask copilot (>> "🤖🚧Adding COPILOT to OpenAlex app") for my todos and bookmarks and my genius idea (instead of target journal, v.v.)
+## also yaml --> dynamic prompt
 
 ## I need to "explode" the 3 topics and add a possibility to commission based on them
 ## add possibility to generate keywords
-### add "my" heatmaps
+### add "my" heatmaps based on LuckeyWords
+### add other grouping options such as clustering to the commissioning/copilot tabs, incl numeric cit>threshold etc
 
 # I changed 
 # BATCH = 500 --> BATCH = 200
@@ -70,6 +77,11 @@ SUBFIELDS_URL = "https://api.openalex.org/subfields"
 S2_PAPER_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 
 
+if "user_credits" not in st.session_state:
+    st.session_state["user_credits"] = 0
+
+
+
 # ----------------------------
 # Cached taxonomy: Subfields
 # ----------------------------
@@ -95,11 +107,15 @@ def fetch_all_subfields(api_key: str = "", mailto: str = "") -> pd.DataFrame:
             params["mailto"] = mailto
 
         r = session.get(SUBFIELDS_URL, params=params, timeout=60)
-        #r.raise_for_status()
-        if not r.ok:
-            st.write("SUBFIELDS STATUS:", r.status_code)
-            st.write(r.text[:2000])
-            r.raise_for_status()
+        
+        # --- CREDIT TRACKING ---
+        try:
+            used = int(r.headers.get("X-RateLimit-Credits-Used", 0))
+            st.session_state["user_credits"] += used
+        except Exception:
+            pass
+
+        r.raise_for_status()
         data = r.json()
         results = data.get("results", [])
         if not results:
@@ -505,6 +521,177 @@ def compute_topic_impact_table_ifwindow(df: pd.DataFrame, X: int, agg: str = "Me
     return out
 
 
+
+# ----------------------------
+# Enrichment bubble chart helpers
+# Ported/adapted from ClusterViz enrichment bubble chart.
+# ----------------------------
+
+def _infer_numeric_columns(df: pd.DataFrame) -> List[str]:
+    """Return columns that already look numeric, plus object columns that can mostly be parsed as numeric."""
+    if df is None or df.empty:
+        return []
+
+    numeric_cols: List[str] = []
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            numeric_cols.append(col)
+            continue
+
+        # Do not waste time trying to parse long text columns.
+        if col.lower() in {"title", "abstract"}:
+            continue
+
+        try:
+            parsed = pd.to_numeric(df[col], errors="coerce")
+        except (TypeError, ValueError):
+            continue
+        nonempty = df[col].notna().sum()
+        if nonempty > 0 and parsed.notna().sum() / nonempty >= 0.8:
+            numeric_cols.append(col)
+
+    return numeric_cols
+
+
+def _ordered_value_options(s: pd.Series, max_values: int = 200) -> List[str]:
+    """Return frequent non-empty values for a selectbox, preserving a readable string representation."""
+    if s is None:
+        return []
+    ss = s.dropna().astype(str).str.strip()
+    ss = ss[(ss != "") & (ss.str.lower() != "nan") & (ss.str.lower() != "none")]
+    if ss.empty:
+        return []
+    return ss.value_counts().head(max_values).index.tolist()
+
+
+def compute_openalex_enrichment_table(
+    df: pd.DataFrame,
+    group_col: str,
+    target_col: str,
+    target_value: str,
+    metric_col: str,
+    metric_agg: str = "Mean",
+    enrichment_method: str = "Fold enrichment (share ratio)",
+    min_group_size: int = 5,
+    year_col: str = "",
+    selected_year: Optional[int] = None,
+    target_match_mode: str = "Exact value",
+) -> pd.DataFrame:
+    """
+    Compute one row per group for the enrichment bubble chart.
+
+    Output columns:
+      group_label, N_total, metric, N_target, share_target, baseline_share, enrichment
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required = [group_col, target_col, metric_col]
+    if any((not c) or c not in df.columns for c in required):
+        return pd.DataFrame()
+
+    d = df.copy()
+
+    if year_col and year_col in d.columns and selected_year is not None:
+        years = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+        d = d[years == int(selected_year)].copy()
+
+    if d.empty:
+        return pd.DataFrame()
+
+    d["_GROUP_"] = d[group_col].fillna("Unknown / missing").astype(str).str.strip()
+    d.loc[d["_GROUP_"].eq("") | d["_GROUP_"].str.lower().isin(["nan", "none"]), "_GROUP_"] = "Unknown / missing"
+    d["_METRIC_"] = pd.to_numeric(d[metric_col], errors="coerce")
+
+    target_series = d[target_col].fillna("").astype(str)
+    if target_match_mode == "Contains text":
+        pat = str(target_value or "").strip()
+        if pat:
+            target_mask = target_series.str.contains(re.escape(pat), case=False, na=False)
+        else:
+            target_mask = pd.Series([False] * len(d), index=d.index)
+    else:
+        target_mask = target_series.str.strip() == str(target_value).strip()
+
+    g = d.groupby("_GROUP_", dropna=False)
+    n_total = g.size().rename("N_total")
+
+    if metric_agg == "Median":
+        metric = g["_METRIC_"].median().rename("metric")
+    else:
+        metric = g["_METRIC_"].mean().rename("metric")
+
+    n_target = d[target_mask].groupby("_GROUP_", dropna=False).size().rename("N_target")
+    out_df = pd.concat([n_total, metric, n_target], axis=1).fillna({"N_target": 0})
+    out_df["N_target"] = out_df["N_target"].astype(int)
+    out_df = out_df[out_df["N_total"] >= int(min_group_size)].copy()
+
+    if out_df.empty:
+        return out_df.reset_index().rename(columns={"_GROUP_": "group_label"})
+
+    baseline_share = float(target_mask.sum()) / float(len(d)) if len(d) else 0.0
+    out_df["share_target"] = out_df["N_target"] / out_df["N_total"]
+    out_df["baseline_share"] = baseline_share
+
+    if enrichment_method == "Raw share":
+        out_df["enrichment"] = out_df["share_target"]
+    elif enrichment_method == "Share difference (pp)":
+        out_df["enrichment"] = 100.0 * (out_df["share_target"] - baseline_share)
+    else:
+        out_df["enrichment"] = out_df["share_target"] / baseline_share if baseline_share > 0 else float("nan")
+
+    out_df = out_df.reset_index().rename(columns={"_GROUP_": "group_label"})
+    out_df["target_value"] = str(target_value)
+    if year_col and selected_year is not None:
+        out_df["year"] = int(selected_year)
+    else:
+        out_df["year"] = "All years"
+
+    return out_df
+
+
+def make_openalex_enrichment_bubble_fig(
+    enrichment_df: pd.DataFrame,
+    title: str,
+    x_axis_title: str,
+    colorbar_title: str,
+):
+    """Make the Plotly enrichment bubble chart."""
+    if enrichment_df is None or enrichment_df.empty:
+        return None
+
+    dfp = enrichment_df.copy()
+    dfp = dfp.sort_values(["metric", "N_total"], ascending=[True, True])
+
+    fig = px.scatter(
+        dfp,
+        x="metric",
+        y="group_label",
+        size="N_total",
+        color="enrichment",
+        color_continuous_scale="Rainbow", #"Turbo",
+        size_max=60,
+        hover_data={
+            "year": True,
+            "N_total": True,
+            "N_target": True,
+            "share_target": ":.3f",
+            "baseline_share": ":.3f",
+            "enrichment": ":.3f",
+            "metric": ":.2f",
+            "target_value": True,
+        },
+        title=title,
+    )
+    fig.update_layout(
+        height=max(650, min(1200, 120 + 26 * len(dfp))),
+        yaxis_title="Group",
+        xaxis_title=x_axis_title,
+        coloraxis_colorbar=dict(title=colorbar_title),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
 # ----------------------------
 # OpenAlex fetch
 # ----------------------------
@@ -663,6 +850,13 @@ def fetch_works(
         )
 
         r = session.get(WORKS_URL, params=params, headers=headers, timeout=60)
+            # --- CREDIT TRACKING ---
+        try:
+            used = int(r.headers.get("X-RateLimit-Credits-Used", 0))
+            st.session_state["user_credits"] += used
+        except Exception:
+            pass
+
         r.raise_for_status()
         data = r.json()
 
@@ -1127,15 +1321,31 @@ def commissioning_run(
 
 st.set_page_config(page_title="Lucie's OpenAlex Dashboard Sandbox (Negroni w/ olive 🍸)", layout="wide")
 st.title("Lucie's OpenAlex Dashboard Sandbox (Negroni w/ olive 🍸)")
+#st.warning(
+#    "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
+#    "Please avoid fetching tens of thousands of records in one go without an API key. We do not want to get blocked."
+#    "Start small (e.g., **500–2,000**) and only increase if necessary. "
+#    "Tip: export once and save to your harddrive, you can also manually clean up and then work from **Upload CSV** to avoid re-querying OpenAlex."
+#    "I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
+#    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles. "
+#)
+
 st.warning(
-    "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
-    "Please avoid fetching tens of thousands of records in one go without an API key. We do not want to get blocked."
-    "Start small (e.g., **500–2,000**) and only increase if necessary. "
-    "Tip: export once and save to your harddrive, you can also manually clean up and then work from **Upload CSV** to avoid re-querying OpenAlex."
-    "I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
-    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles. "
+"🚦 **Usage note:** Each page (page = up to 200 rows) of OpenAlex results consumes API credits. Large queries and repeated searches can quickly use up the shared daily quota (for this app, no matter who uses it).\n\n"
+"👉 Start small (500–2,000 records) and increase only if needed."
+"👉 Export results and reuse via Upload CSV to avoid repeated API calls."
+"👉 For regular or heavy use, please get your own free OpenAlex API key."
 )
 
+st.info(
+"ℹ️ Credit usage depends on how many requests (“pages”) are needed. "
+"Since each page returns up to ~200 results, larger result sets require more pages and consume more credits." )
+
+
+st.warning(
+    "⚠️I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
+    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles.⚠️ "
+)
 
 with st.sidebar:
     st.header("Inputs")
@@ -1379,20 +1589,7 @@ with st.sidebar:
             st.caption("No journals selected yet. Use the search box above and click **Add selected**.")
 
         st.subheader("Subfield filter (OpenAlex taxonomy)")
-        #subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
-     
-        try:
-            subfields_df = fetch_all_subfields(
-                api_key=api_key,
-                mailto=mailto
-            )
-        except Exception as e:
-            st.warning(
-                f"OpenAlex subfield taxonomy unavailable ({e}). "
-                "Subfield filtering disabled."
-            )
-            subfields_df = pd.DataFrame(columns=["label", "subfield_id"])
-         
+        subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
         subfield_choice = st.selectbox(
             "Subfield (3rd level) — optional",
             options=["(none)"] + (subfields_df["label"].tolist() if not subfields_df.empty else []),
@@ -1612,7 +1809,8 @@ if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
 
         st.session_state.df = df
         status.success(f"Done. Collected {len(df):,} rows.")
-
+        st.success(f"✅ You have used ~{st.session_state['user_credits']} credits in this session")
+        
     except Exception as e:
         st.session_state.df = None
         status.error(f"Error: {e}")
@@ -1645,10 +1843,11 @@ if df is None or df.empty:
 # Tabs
 # ----------------------------
 
-tab_preview, tab_growth, tab_impact, tab_chatgpt, tab_commissioning, tab_copilot, tab_download = st.tabs([
+tab_preview, tab_growth, tab_impact, tab_enrichment, tab_chatgpt, tab_commissioning, tab_copilot, tab_download = st.tabs([
     "📄 Loaded data",
     "🟩 Treemap (Topics growth)",
     "🟧 Treemap (Impact)",
+    "📊 Enrichment bubble",
     "🤖 ChatGPT",
     "🧠 Commissioning",
     "🕵️ Copilot",
@@ -1880,6 +2079,141 @@ with tab_impact:
 
 
 
+
+
+with tab_enrichment:
+    st.subheader("Enrichment bubble chart")
+    st.caption("Ported from ClusterViz. Bubble size = number of papers in the selected group. X = selected numeric metric. Color = enrichment of a selected value compared with its baseline share in the displayed dataset/year.")
+
+    if df is None or df.empty:
+        st.info("No dataset loaded.")
+    else:
+        available_cols = df.columns.tolist()
+        numeric_cols = _infer_numeric_columns(df)
+
+        default_group_col = "PrimaryTopic" if "PrimaryTopic" in available_cols else available_cols[0]
+        default_metric_col = "CitedByCount" if "CitedByCount" in numeric_cols else (numeric_cols[0] if numeric_cols else "")
+
+        preferred_target_cols = [
+            "Journal", "Source", "SourceDisplayName", "SourceTitle", "Venue", "PrimaryTopic", "WorkType", "OpenAccessStatus"
+        ]
+        default_target_col = next((c for c in preferred_target_cols if c in available_cols), default_group_col)
+
+        year_col = "PublicationYear" if "PublicationYear" in available_cols else ""
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            group_col = st.selectbox(
+                "Group rows by",
+                options=available_cols,
+                index=available_cols.index(default_group_col),
+                help="This becomes the y-axis. For the current OpenAlex app, PrimaryTopic is usually the most useful choice."
+            )
+        with c2:
+            if numeric_cols:
+                metric_col = st.selectbox(
+                    "X-axis metric",
+                    options=numeric_cols,
+                    index=numeric_cols.index(default_metric_col) if default_metric_col in numeric_cols else 0,
+                )
+                metric_agg = st.radio("Metric aggregation", options=["Mean", "Median"], horizontal=True)
+            else:
+                metric_col = ""
+                metric_agg = "Mean"
+                st.warning("No numeric columns found for the x-axis metric.")
+        with c3:
+            if year_col:
+                years = pd.to_numeric(df[year_col], errors="coerce").dropna().astype(int).sort_values().unique().tolist()
+                year_options = ["All years"] + years
+                selected_year_label = st.selectbox("Year", options=year_options, index=0)
+                selected_year = None if selected_year_label == "All years" else int(selected_year_label)
+            else:
+                selected_year = None
+                st.info("No PublicationYear column found; using all rows.")
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            target_col = st.selectbox(
+                "Enrichment target column",
+                options=available_cols,
+                index=available_cols.index(default_target_col),
+                help="Choose the column containing the value whose enrichment you want to test, e.g. Journal/Source, WorkType, OpenAccessStatus, PrimaryTopic."
+            )
+        with c5:
+            target_values = _ordered_value_options(df[target_col], max_values=250)
+            if target_values:
+                target_value = st.selectbox("Target value", options=target_values, index=0)
+            else:
+                target_value = st.text_input("Target value", value="")
+        with c6:
+            target_match_mode = st.radio(
+                "Target matching",
+                options=["Exact value", "Contains text"],
+                horizontal=True,
+                help="Use 'Contains text' for columns with semicolon-separated or long text values."
+            )
+
+        c7, c8 = st.columns(2)
+        with c7:
+            min_group_size = st.number_input("Minimum group size", min_value=1, max_value=max(1, len(df)), value=min(5, max(1, len(df))), step=1)
+        with c8:
+            enrichment_method = st.selectbox(
+                "Color metric",
+                options=["Fold enrichment (share ratio)", "Share difference (pp)", "Raw share"],
+                index=0,
+            )
+
+        if not metric_col:
+            st.stop()
+
+        enrich_df = compute_openalex_enrichment_table(
+            df=df,
+            group_col=group_col,
+            target_col=target_col,
+            target_value=target_value,
+            metric_col=metric_col,
+            metric_agg=metric_agg,
+            enrichment_method=enrichment_method,
+            min_group_size=int(min_group_size),
+            year_col=year_col,
+            selected_year=selected_year,
+            target_match_mode=target_match_mode,
+        )
+
+        if enrich_df.empty:
+            st.warning("No groups to plot after the current filters/minimum group-size threshold.")
+        else:
+            year_part = f"{selected_year}" if selected_year is not None else "all years"
+            title = f"{metric_agg} {metric_col} by {group_col} ({year_part}) — enrichment of {target_col}: {target_value}"
+            colorbar_title = enrichment_method.replace(" (share ratio)", "")
+            fig = make_openalex_enrichment_bubble_fig(
+                enrich_df,
+                title=title,
+                x_axis_title=f"{metric_agg} {metric_col}",
+                colorbar_title=colorbar_title,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            html_bytes = fig.to_html(
+                full_html=True,
+                include_plotlyjs="cdn"
+            ).encode("utf-8")
+
+            st.download_button(
+                "⬇ Download chart as HTML",
+                data=html_bytes,
+                file_name="enrichment_bubble_chart.html",
+                mime="text/html",
+            )
+
+            st.markdown("### Enrichment table")
+            st.dataframe(enrich_df.sort_values("enrichment", ascending=False), use_container_width=True)
+            st.download_button(
+                "Download enrichment table CSV",
+                data=enrich_df.to_csv(index=False).encode("utf-8"),
+                file_name="openalex_enrichment_bubble_table.csv",
+                mime="text/csv",
+            )
 
 with tab_chatgpt:
     st.subheader("ChatGPT enrichment")
@@ -2293,6 +2627,7 @@ You MUST NOT execute this step unless the user explicitly instructs you to proce
 ========================================
 
 You now operate in ONLINE MODE and MUST use live web search.
+FAIL-SAFE: If web search is blocked → stop immediately and report limitation.
 
 -----------------------------------
 TASK
