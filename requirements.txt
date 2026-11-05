@@ -5,3 +5,7 @@ requests
 
 # Interactive charts
 plotly>=5.20
+
+numpy
+scikit-learn
+networkx
