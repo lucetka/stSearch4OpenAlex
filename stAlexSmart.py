@@ -1,0 +1,3073 @@
+# derived from stSearchDashOpenAlex_PinaColada_subfield_multiselect.py
+# which was stSearchDashOpenAlex_ouzo_enrichment_bubble.py complemented with the edits to handle field loading errors from the version edited directly in GitHub downloaded as sandbox4OpenAlex_github9Jul2026.py
+#In your master app's fetch_works function, the OpenAlex API query filter string is hardcoded to use primary_topic.subfield.id:
+#python
+#filters.append(f"primary_topic.subfield.id:{joined_subfields}")
+#Use code with caution.
+#OpenAlex only assigns a Primary Topic (and therefore a primary subfield) to works where their machine-learning classifier is exceptionally confident. If a 2026 paper is too new, hasn't accumulated citations, or has an abstract that is hard to categorize, OpenAlex leaves the primary_topic field completely blank.
+#Because your script enforces a strict primary_topic.subfield.id filter at the API level, it completely filters out any paper where that field is missing. For the Aging subfield in 2026, there are exactly 1,933 papers that have a fully resolved, indexed primary topic tag.
+
+
+
+###continue with this verison; the next thing to do: sampling/randomization
+
+# This _negroni is simply copied stSearchDashOpenAlex_martini_with_olive_deployed_Copilot.py
+# 
+# Ask copilot (>> "🤖🚧Adding COPILOT to OpenAlex app") for my todos and bookmarks and my genius idea (instead of target journal, v.v.)
+## also yaml --> dynamic prompt
+
+## I need to "explode" the 3 topics and add a possibility to commission based on them
+## add possibility to generate keywords
+### add "my" heatmaps based on LuckeyWords
+### add other grouping options such as clustering to the commissioning/copilot tabs, incl numeric cit>threshold etc
+
+# I changed 
+# BATCH = 500 --> BATCH = 200
+# I set specter max rows to embed to 6000 from 5000 while doing the Adv Sci test
+
+# note about COUNTRIES
+# Because OpenAlex only returns up to the first 100 authorships in the work object, the “all authors from selected countries” mode
+# #is limited by what OpenAlex returns in authorships. The docs state that authorships is limited to the first 100 authors for API performance.
+
+### I have now enabled SPECTER - in 4 lines around 1235 (numbering in _iceberg) - just flip i to TRUE again to lock it
+
+ #      # SPECTER2 toggle (disabled for now)
+ #       st.subheader("Embeddings (optional)")
+ #       fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=False)
+ #       s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=False)
+ #       max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=5000, value=200, step=50, disabled=False)
+ #       s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=False)
+
+
+#I need to add slicing by journal and the “other topics” and best also by any column –> to be now able to go to commissioning tab and filter out “Nature Cell etc”
+
+# copied _gin and renamed to _iceberg for including Primary Topic filtering manually as Copilot keeps screwing up
+# _gin is renamed stSearchDashOpenAlex_fernet_journalsAccum_v4_nostop - Copy.py
+# in _fernet I added proper multiselect for journals - even though it's not very intuitive. I shall improve it.
+# Then the disappearing button was patched --> _gin
+
+# I had a version mess. This version is _dornfelder_SPECTER2 from 5pm 13-May-26 "merged" into stSearchDashOpenAlex_espresso_patched_v2.py
+# saved earlier that day but actually more "advanced" - by mistake the whole SPECTER2 code was chucked instead of just GUI disabled
+# so now it was added back into "espresso". Also further missing parts were added back
+# 
+# This version was "merged" by Copilot from the two version and was named stSearchDashOpenAlex_espresso_merged_with_SPECTER2_disabled_plus_TopicID.py
+# I copied and renamed this to _espresso_macchiato.py
+
+# # in the meantime I had given Copilot the _dornfelder_SPECTER2 version to start implementing chatGPT based on my old (2024) Jupyter notebooks working with NatComm
+## so that branch is a "cul-de-sac" and I'm going to re-do this (better hopefully, becuase the implementaion in the _dornfelder_specter2 was anyways a bit dumb
+
+# Goals (What Copilot remembers per Lucie):
+# Known issue: some journals such as BBA series or Analytical Biochemistry retrieve dramatically fewer records than from WoS or the OpenAlex web interface; under investigation
+# Known issue: sometimes Meeting Abstracts are wrongly classified as Articles --> here on the other hand results are blown up with "wrong" results; for now,
+# I recommend checking the expected number of records and cleaning downloaded results in excel if necessary. The Meeting Abstracts all started with the word Abstract in the title,
+# so for my dataset from J Biological Chemistry I was able to simply chuck them in Excel but filtering for the word Abstract in the title et voila the number of records matches WoS
+
+# SPECTER2 toggle is present but DISABLED for now (deployment safety).
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import TruncatedSVD
+import networkx as nx
+import plotly.express as px
+import plotly.graph_objects as go
+from collections import Counter
+import itertools
+import io
+import time
+import json
+import re
+import io
+from typing import Optional, Dict, Any, List
+
+import pandas as pd
+import requests
+import streamlit as st
+import plotly.express as px
+
+WORKS_URL = "https://api.openalex.org/works"
+SOURCES_URL = "https://api.openalex.org/sources"
+SUBFIELDS_URL = "https://api.openalex.org/subfields"
+
+# Semantic Scholar (S2) Graph API (for SPECTER2 embeddings) — code retained but UI is disabled by default
+S2_PAPER_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
+
+
+
+
+
+
+
+
+if "user_credits" not in st.session_state:
+    st.session_state["user_credits"] = 0
+
+
+
+# ----------------------------
+# Cached taxonomy: Subfields
+# ----------------------------
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def fetch_all_subfields(api_key: str = "", mailto: str = "") -> pd.DataFrame:
+    """Fetch all OpenAlex subfields (3rd level taxonomy) into a DataFrame.
+
+    Cached for 24h to avoid repeated calls.
+    """
+    session = requests.Session()
+    rows: List[Dict[str, Any]] = []
+
+    cursor = "*"
+    while True:
+        params: Dict[str, Any] = {
+            "per_page": 200,
+            "cursor": cursor,
+            "select": ",".join(["id", "display_name", "field", "domain"]),
+        }
+        if api_key:
+            params["api_key"] = api_key
+        if mailto:
+            params["mailto"] = mailto
+
+        r = session.get(SUBFIELDS_URL, params=params, timeout=60)
+        
+        # --- CREDIT TRACKING ---
+        try:
+            used = int(r.headers.get("X-RateLimit-Credits-Used", 0))
+            st.session_state["user_credits"] += used
+        except Exception:
+            pass
+
+        #r.raise_for_status()
+        if not r.ok:
+            st.write("SUBFIELDS STATUS:", r.status_code)
+            st.write(r.text[:2000])
+            r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        for s in results:
+            sid_url = s.get("id") or ""
+            sid = sid_url.rsplit("/", 1)[-1] if sid_url else ""
+            field = s.get("field") or {}
+            domain = s.get("domain") or {}
+            rows.append({
+                "subfield_id": sid,
+                "subfield_id_url": sid_url,
+                "subfield": s.get("display_name") or "",
+                "field": field.get("display_name") or "",
+                "domain": domain.get("display_name") or "",
+            })
+
+        cursor = (data.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["label"] = df.apply(lambda r: f"{r['subfield']}  —  {r['field']} / {r['domain']}".strip(), axis=1)
+    df = df.sort_values(["domain", "field", "subfield"], kind="stable").reset_index(drop=True)
+    return df
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def save_country_labels():
+            st.session_state.country_labels_saved = st.session_state._country_labels
+
+TOPICS_URL = "https://api.openalex.org/topics"
+
+def search_topics(query: str, api_key: str = "", mailto: str = "", max_results: int = 15) -> List[Dict[str, Any]]:
+    if not query.strip():
+        return []
+
+    params = {
+        "search": query,
+        "per-page": max_results
+    }
+
+    if mailto:
+        params["mailto"] = mailto
+
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        r = requests.get(TOPICS_URL, params=params, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("results", [])
+    except Exception:
+        return []
+
+
+def invert_index_to_text(inv: Optional[Dict[str, List[int]]]) -> str:
+    """Reconstruct abstract text from OpenAlex abstract_inverted_index."""
+    if not inv or not isinstance(inv, dict):
+        return ""
+    positions = {}
+    for word, idxs in inv.items():
+        if not isinstance(idxs, list):
+            continue
+        for i in idxs:
+            positions[i] = word
+    if not positions:
+        return ""
+    return " ".join(positions[i] for i in sorted(positions.keys()))
+
+
+def safe_get_journal_from_primary_location(work: Dict[str, Any]) -> str:
+    """Return journal/venue name from work['primary_location']['source']['display_name'].
+    Always returns a string (never None).
+    """
+    pl = work.get("primary_location") or {}
+    src = pl.get("source") or {}
+    name = src.get("display_name") or ""
+    return str(name) if name is not None else ""
+
+def safe_get_source_id_from_primary_location(work: Dict[str, Any]) -> str:
+    """Return OpenAlex source id (Sxxxx) from primary_location.source.id."""
+    pl = work.get("primary_location") or {}
+    src = pl.get("source") or {}
+    sid_url = src.get("id") or ""
+    return sid_url.rsplit("/", 1)[-1] if sid_url else ""
+
+def topics_to_strings(work: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]:
+    """
+    Flatten work['topics'] list into CSV-friendly strings.
+    Keeps top N topics (by score if present).
+    """
+    topics = work.get("topics") or []
+    if not isinstance(topics, list):
+        topics = []
+
+    # Some topics include "score". Sort if present, else keep order.
+    def score(t):
+        s = t.get("score")
+        return s if isinstance(s, (int, float)) else -1
+
+    topics_sorted = sorted(
+        [t for t in topics if isinstance(t, dict)],
+        key=score,
+        reverse=True
+    )
+
+    top = topics_sorted[:top_n]
+    names = [t.get("display_name", "") for t in top if t.get("display_name")]
+    ids = [(t.get("id", "") or "").rsplit("/", 1)[-1] for t in top if t.get("id")]
+
+    return {
+        "TopicsTopN": "; ".join(names),
+        "TopicIDsTopN": "; ".join(ids),
+        "TopicsCount": len(topics),
+    }
+
+
+# ----------------------------
+# Semantic Scholar: SPECTER2 embeddings (retained for future work)
+# NOTE: The UI toggle is disabled (greyed out) to prevent accidental use.
+# ----------------------------
+def _doi_to_s2_id(doi_url_or_raw: str) -> str:
+    """Convert DOI URL (https://doi.org/...) or raw DOI into S2 ID format DOI:..."""
+    if not doi_url_or_raw:
+        return ""
+    s = str(doi_url_or_raw).strip()
+    s = re.sub(r"^https?://doi\.org/", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^doi:", "", s, flags=re.IGNORECASE)
+    return f"DOI:{s}" if s else ""
+
+
+def _extract_specter2_from_embedding_obj(emb_obj):
+    """Robust extraction of a vector from various embedding payload shapes."""
+    if emb_obj is None:
+        return None
+    if isinstance(emb_obj, list):
+        return emb_obj
+    if isinstance(emb_obj, dict):
+        for k in ("specter_v2", "specter2", "specter_2", "vector"):
+            v = emb_obj.get(k)
+            if isinstance(v, list):
+                return v
+    return None
+
+
+def s2_fetch_specter2_embeddings(s2_ids: list[str], s2_api_key: str = "", sleep_s: float = 0.35) -> dict:
+    """Fetch SPECTER2 embeddings from Semantic Scholar Graph API /paper/batch.
+
+    Returns mapping: requested_id -> {paperId, corpusId, specter2}
+    """
+    out: dict = {}
+    if not s2_ids:
+        return out
+
+    headers = {}
+    if s2_api_key:
+        headers["x-api-key"] = s2_api_key
+
+    # Request full embedding object and extract SPECTER2 vector robustly.
+    fields = "paperId,corpusId,embedding"
+
+    BATCH = 200
+    for i in range(0, len(s2_ids), BATCH):
+        chunk = s2_ids[i:i + BATCH]
+        r = requests.post(
+            S2_PAPER_BATCH_URL,
+            params={"fields": fields},
+            json={"ids": chunk},
+            headers=headers,
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if isinstance(data, list):
+            for req_id, item in zip(chunk, data):
+                if not isinstance(item, dict) or item.get("error"):
+                    continue
+                emb_obj = item.get("embedding")
+                vec = _extract_specter2_from_embedding_obj(emb_obj)
+                if vec is None:
+                    continue
+                out[req_id] = {
+                    "paperId": item.get("paperId"),
+                    "corpusId": item.get("corpusId"),
+                    "specter2": vec,
+                }
+
+        time.sleep(sleep_s)
+
+    return out
+
+
+def attach_specter2_to_df(df: pd.DataFrame, s2_api_key: str = "", max_rows: int = 200, sleep_s: float = 0.35) -> pd.DataFrame:
+    """Attach SPECTER2 embeddings to DataFrame (proof-of-principle).
+
+    Adds columns (always created):
+      - S2_paperId, S2_corpusId, SPECTER2, SPECTER2_dim
+
+    Only the first max_rows are queried to keep it fast.
+    """
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+
+    # Always create columns so they remain visible even if fetching fails.
+    for col in ("S2_paperId", "S2_corpusId", "SPECTER2", "SPECTER2_dim"):
+        if col not in d.columns:
+            d[col] = pd.NA
+
+    if "DOI" not in d.columns:
+        return d
+
+    n = min(int(max_rows), len(d))
+    s2_ids = [_doi_to_s2_id(x) for x in d.loc[: n - 1, "DOI"].tolist()]
+    s2_ids = [x for x in s2_ids if x]
+    if not s2_ids:
+        return d
+
+    emb_map = s2_fetch_specter2_embeddings(s2_ids, s2_api_key=s2_api_key, sleep_s=sleep_s)
+
+    for idx in range(n):
+        req_id = _doi_to_s2_id(d.at[idx, "DOI"])
+        item = emb_map.get(req_id)
+        if not item:
+            continue
+        vec = item.get("specter2")
+        d.at[idx, "S2_paperId"] = item.get("paperId")
+        d.at[idx, "S2_corpusId"] = item.get("corpusId")
+        d.at[idx, "SPECTER2"] = json.dumps(vec)
+        d.at[idx, "SPECTER2_dim"] = len(vec) if isinstance(vec, list) else pd.NA
+
+    return d
+
+
+    return src.get("display_name") or ""
+
+
+def source_id_short(openalex_source_id_url: str) -> str:
+    if not openalex_source_id_url:
+        return ""
+    return openalex_source_id_url.rsplit("/", 1)[-1]
+
+
+def find_sources_by_name(journal_query: str, api_key: str = "", mailto: str = "", max_results: int = 25) -> List[Dict[str, Any]]:
+    if not journal_query.strip():
+        return []
+
+    params: Dict[str, Any] = {
+        "search": journal_query.strip(),
+        "per_page": min(max_results, 200),
+        "select": ",".join([
+            "id",
+            "display_name",
+            "host_organization_name",
+            "issn",
+            "issn_l",
+            "type",
+            "works_count",
+            "cited_by_count",
+        ])
+    }
+    if api_key:
+        params["api_key"] = api_key
+    if mailto:
+        params["mailto"] = mailto
+
+    r = requests.get(SOURCES_URL, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+
+def add_citations_by_year_columns(df: pd.DataFrame, years: List[int], src_col: str = "CountsByYear", drop_src: bool = True) -> pd.DataFrame:
+    """Expand CountsByYear list (list of dicts) into wide year columns."""
+    if df is None or df.empty or src_col not in df.columns:
+        return df
+
+    out = df.copy()
+    for y in years:
+        out[str(y)] = 0
+
+    for i, items in enumerate(out[src_col]):
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            y = item.get("year")
+            c = item.get("cited_by_count", 0)
+            if y in years:
+                out.at[i, str(y)] = c
+
+    if drop_src:
+        out = out.drop(columns=[src_col])
+
+    return out
+
+
+def compute_topic_growth_table(
+    df: pd.DataFrame,
+    topic_col: str = "PrimaryTopic",
+    year_col: str = "PublicationYear",
+    start_year: int = 2023,
+    end_year: int = 2025,
+    smoothing: float = 1.0,
+    min_total: int = 5,
+) -> pd.DataFrame:
+    """Aggregate paper counts per topic and compute growth metrics."""
+    if df is None or df.empty or topic_col not in df.columns or year_col not in df.columns:
+        return pd.DataFrame(columns=["Topic", "N_total", "N_start", "N_end", "Delta", "CAGR", "SlopePerYear"]) 
+
+    d = df[[topic_col, year_col]].copy()
+    d[year_col] = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+    d = d.dropna(subset=[topic_col, year_col])
+    d[topic_col] = d[topic_col].astype(str)
+
+    totals = d.groupby(topic_col).size().rename("N_total")
+    c_start = d[d[year_col] == int(start_year)].groupby(topic_col).size().rename("N_start")
+    c_end = d[d[year_col] == int(end_year)].groupby(topic_col).size().rename("N_end")
+
+    out = pd.concat([totals, c_start, c_end], axis=1).fillna(0)
+    out["N_total"] = out["N_total"].astype(int)
+    out["N_start"] = out["N_start"].astype(int)
+    out["N_end"] = out["N_end"].astype(int)
+
+    out = out[out["N_total"] >= int(min_total)].copy()
+
+    years = max(int(end_year) - int(start_year), 1)
+    out["Delta"] = out["N_end"] - out["N_start"]
+    out["CAGR"] = ((out["N_end"] + float(smoothing)) / (out["N_start"] + float(smoothing))) ** (1 / years) - 1
+    out["SlopePerYear"] = out["Delta"] / years
+
+    out = out.reset_index().rename(columns={topic_col: "Topic"})
+    return out
+
+
+def compute_topic_impact_table_alltime(df: pd.DataFrame, agg: str = "Mean", min_n: int = 5) -> pd.DataFrame:
+    """Impact A: all-time citations per paper by topic (mean/median)."""
+    if df is None or df.empty or "PrimaryTopic" not in df.columns or "CitedByCount" not in df.columns:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    d = df[["PrimaryTopic", "CitedByCount"]].copy()
+    d["PrimaryTopic"] = d["PrimaryTopic"].fillna("(Unknown)").astype(str)
+    d["CitedByCount"] = pd.to_numeric(d["CitedByCount"], errors="coerce")
+
+    g = d.groupby("PrimaryTopic")
+    n = g.size().rename("N")
+    if agg == "Median":
+        imp = g["CitedByCount"].median()
+    else:
+        imp = g["CitedByCount"].mean()
+
+    out = pd.concat([n, imp.rename("Impact")], axis=1).reset_index().rename(columns={"PrimaryTopic": "Topic"})
+    out["IsSmall"] = out["N"] < int(min_n)
+    return out
+
+
+def compute_topic_impact_table_ifwindow(df: pd.DataFrame, X: int, agg: str = "Mean", min_n: int = 5) -> pd.DataFrame:
+    """Impact B: citations in year X to papers published in X-1 and X-2 (mean/median per paper), by topic.
+
+    Requires year columns as strings (e.g., '2025') OR CountsByYear already expanded.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    if "PrimaryTopic" not in df.columns or "PublicationYear" not in df.columns:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    colX = str(int(X))
+    if colX not in df.columns:
+        # cannot compute
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    d = df[["PrimaryTopic", "PublicationYear", colX]].copy()
+    d["PrimaryTopic"] = d["PrimaryTopic"].fillna("(Unknown)").astype(str)
+    d["PublicationYear"] = pd.to_numeric(d["PublicationYear"], errors="coerce").astype("Int64")
+    d[colX] = pd.to_numeric(d[colX], errors="coerce").fillna(0)
+
+    d = d[d["PublicationYear"].isin([int(X) - 1, int(X) - 2])].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"]) 
+
+    g = d.groupby("PrimaryTopic")
+    n = g.size().rename("N")
+    if agg == "Median":
+        imp = g[colX].median()
+    else:
+        imp = g[colX].mean()
+
+    out = pd.concat([n, imp.rename("Impact")], axis=1).reset_index().rename(columns={"PrimaryTopic": "Topic"})
+    out["IsSmall"] = out["N"] < int(min_n)
+    return out
+
+
+
+# ----------------------------
+# Enrichment bubble chart helpers
+# Ported/adapted from ClusterViz enrichment bubble chart.
+# ----------------------------
+
+def _infer_numeric_columns(df: pd.DataFrame) -> List[str]:
+    """Return columns that already look numeric, plus object columns that can mostly be parsed as numeric."""
+    if df is None or df.empty:
+        return []
+
+    numeric_cols: List[str] = []
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            numeric_cols.append(col)
+            continue
+
+        # Do not waste time trying to parse long text columns.
+        if col.lower() in {"title", "abstract"}:
+            continue
+
+        try:
+            parsed = pd.to_numeric(df[col], errors="coerce")
+        except (TypeError, ValueError):
+            continue
+        nonempty = df[col].notna().sum()
+        if nonempty > 0 and parsed.notna().sum() / nonempty >= 0.8:
+            numeric_cols.append(col)
+
+    return numeric_cols
+
+
+def _ordered_value_options(s: pd.Series, max_values: int = 200) -> List[str]:
+    """Return frequent non-empty values for a selectbox, preserving a readable string representation."""
+    if s is None:
+        return []
+    ss = s.dropna().astype(str).str.strip()
+    ss = ss[(ss != "") & (ss.str.lower() != "nan") & (ss.str.lower() != "none")]
+    if ss.empty:
+        return []
+    return ss.value_counts().head(max_values).index.tolist()
+
+
+def compute_openalex_enrichment_table(
+    df: pd.DataFrame,
+    group_col: str,
+    target_col: str,
+    target_value: str,
+    metric_col: str,
+    metric_agg: str = "Mean",
+    enrichment_method: str = "Fold enrichment (share ratio)",
+    min_group_size: int = 5,
+    year_col: str = "",
+    selected_year: Optional[int] = None,
+    target_match_mode: str = "Exact value",
+) -> pd.DataFrame:
+    """
+    Compute one row per group for the enrichment bubble chart.
+
+    Output columns:
+      group_label, N_total, metric, N_target, share_target, baseline_share, enrichment
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    required = [group_col, target_col, metric_col]
+    if any((not c) or c not in df.columns for c in required):
+        return pd.DataFrame()
+
+    d = df.copy()
+
+    if year_col and year_col in d.columns and selected_year is not None:
+        years = pd.to_numeric(d[year_col], errors="coerce").astype("Int64")
+        d = d[years == int(selected_year)].copy()
+
+    if d.empty:
+        return pd.DataFrame()
+
+    d["_GROUP_"] = d[group_col].fillna("Unknown / missing").astype(str).str.strip()
+    d.loc[d["_GROUP_"].eq("") | d["_GROUP_"].str.lower().isin(["nan", "none"]), "_GROUP_"] = "Unknown / missing"
+    d["_METRIC_"] = pd.to_numeric(d[metric_col], errors="coerce")
+
+    target_series = d[target_col].fillna("").astype(str)
+    if target_match_mode == "Contains text":
+        pat = str(target_value or "").strip()
+        if pat:
+            target_mask = target_series.str.contains(re.escape(pat), case=False, na=False)
+        else:
+            target_mask = pd.Series([False] * len(d), index=d.index)
+    else:
+        target_mask = target_series.str.strip() == str(target_value).strip()
+
+    g = d.groupby("_GROUP_", dropna=False)
+    n_total = g.size().rename("N_total")
+
+    if metric_agg == "Median":
+        metric = g["_METRIC_"].median().rename("metric")
+    else:
+        metric = g["_METRIC_"].mean().rename("metric")
+
+    n_target = d[target_mask].groupby("_GROUP_", dropna=False).size().rename("N_target")
+    out_df = pd.concat([n_total, metric, n_target], axis=1).fillna({"N_target": 0})
+    out_df["N_target"] = out_df["N_target"].astype(int)
+    out_df = out_df[out_df["N_total"] >= int(min_group_size)].copy()
+
+    if out_df.empty:
+        return out_df.reset_index().rename(columns={"_GROUP_": "group_label"})
+
+    baseline_share = float(target_mask.sum()) / float(len(d)) if len(d) else 0.0
+    out_df["share_target"] = out_df["N_target"] / out_df["N_total"]
+    out_df["baseline_share"] = baseline_share
+
+    if enrichment_method == "Raw share":
+        out_df["enrichment"] = out_df["share_target"]
+    elif enrichment_method == "Share difference (pp)":
+        out_df["enrichment"] = 100.0 * (out_df["share_target"] - baseline_share)
+    else:
+        out_df["enrichment"] = out_df["share_target"] / baseline_share if baseline_share > 0 else float("nan")
+
+    out_df = out_df.reset_index().rename(columns={"_GROUP_": "group_label"})
+    out_df["target_value"] = str(target_value)
+    if year_col and selected_year is not None:
+        out_df["year"] = int(selected_year)
+    else:
+        out_df["year"] = "All years"
+
+    return out_df
+
+
+def make_openalex_enrichment_bubble_fig(
+    enrichment_df: pd.DataFrame,
+    title: str,
+    x_axis_title: str,
+    colorbar_title: str,
+):
+    """Make the Plotly enrichment bubble chart."""
+    if enrichment_df is None or enrichment_df.empty:
+        return None
+
+    dfp = enrichment_df.copy()
+    dfp = dfp.sort_values(["metric", "N_total"], ascending=[True, True])
+
+    fig = px.scatter(
+        dfp,
+        x="metric",
+        y="group_label",
+        size="N_total",
+        color="enrichment",
+        color_continuous_scale="Rainbow", #"Turbo",
+        size_max=60,
+        hover_data={
+            "year": True,
+            "N_total": True,
+            "N_target": True,
+            "share_target": ":.3f",
+            "baseline_share": ":.3f",
+            "enrichment": ":.3f",
+            "metric": ":.2f",
+            "target_value": True,
+        },
+        title=title,
+    )
+    fig.update_layout(
+        height=max(650, min(1200, 120 + 26 * len(dfp))),
+        yaxis_title="Group",
+        xaxis_title=x_axis_title,
+        coloraxis_colorbar=dict(title=colorbar_title),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    return fig
+
+# ----------------------------
+# OpenAlex fetch
+# ----------------------------
+
+def build_works_params(
+    cursor: str,
+    keyword_query: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    api_key: str,
+    mailto: str,
+    per_page: int,
+    source_ids: Optional[List[str]] = None,
+    subfield_ids: Optional[List[str]] = None,
+    #primary_topic_id: Optional[str] = None,  # ✅ NEW in _iceberg
+    primary_topic_ids: Optional[List[str]] = None,
+    work_types: Optional[List[str]] = None,
+    countries: Optional[List[str]] = None,
+    #country_mode: str = "Any author (default)",
+    require_abstract: bool = True,
+    require_doi: bool = True,
+    include_xpac: bool = True,
+) -> Dict[str, Any]:
+    filters: List[str] = []
+    if require_doi:
+        filters.append("has_doi:true")
+    if require_abstract:
+        filters.append("has_abstract:true")
+    
+    
+    # publication_year filtering (GUI-consistent)
+    if year_from is not None and year_to is not None:
+        filters.append(f"publication_year:{int(year_from)}-{int(year_to)}")
+    elif year_from is not None:
+        filters.append(f"publication_year:{int(year_from)}-9999")
+    elif year_to is not None:
+        filters.append(f"publication_year:0-{int(year_to)}")
+
+    if source_ids:
+        sources_val = "|".join([sid for sid in source_ids if sid])
+        if sources_val:
+            filters.append(f"primary_location.source.id:{sources_val}")
+    
+    # --- Work type ---
+    if work_types:
+        filters.append(f"type:{'|'.join(work_types)}")
+
+    # --- Country (first author / affiliation workaround) ---
+    # --- Country (API-level only for default mode) ---
+    #if countries and country_mode == "Any author (default)":
+    #    filters.append(f"authorships.institutions.country_code:{'|'.join(countries)}")
+    if countries:
+        filters.append(f"authorships.institutions.country_code:{'|'.join(countries)}")
+        
+
+
+    if subfield_ids:
+        joined_subfields = "|".join([sid for sid in subfield_ids if sid])
+        if joined_subfields:
+            #filters.append(f"primary_topic.subfield.id:{joined_subfields}")
+            filters.append(f"topics.subfield.id:{joined_subfields}")
+
+    #if primary_topic_id:
+    #    filters.append(f"primary_topic.id:{primary_topic_id}")   # ✅ NEW in _iceberg
+
+    if primary_topic_ids:
+        joined = "|".join(primary_topic_ids)
+        filters.append(f"primary_topic.id:{joined}")
+
+    params: Dict[str, Any] = {
+        "filter": ",".join(filters),
+        "per_page": per_page,
+        "cursor": cursor,
+        "select": ",".join([
+            "id",
+            "doi",
+            "display_name",
+            "abstract_inverted_index",
+            "authorships",
+            "primary_topic",
+            "topics",
+            "keywords",
+            "publication_year",
+            "publication_date",
+            "primary_location",
+            "type",
+            "cited_by_count",
+            "counts_by_year",
+            "referenced_works_count",
+        ]),
+    }
+
+    if include_xpac:
+        params["include_xpac"] = "true"
+
+    if keyword_query.strip():
+        params["search"] = keyword_query.strip()
+
+    if api_key:
+        params["api_key"] = api_key
+    if mailto:
+        params["mailto"] = mailto
+
+    return params
+
+
+def fetch_works(
+    n_rows: int,
+    keyword_query: str,
+    year_from: Optional[int],
+    year_to: Optional[int],
+    api_key: str,
+    mailto: str,
+    sleep_s: float,
+    source_ids: Optional[List[str]] = None,
+    subfield_ids: Optional[List[str]] = None,
+    primary_topic_ids: Optional[List[str]] = None,
+    work_types: Optional[List[str]] = None,
+    countries: Optional[List[str]] = None,
+    #country_mode: str = "Any author (default)",
+    require_abstract: bool = True,
+    require_doi: bool = True,
+    include_xpac: bool = True,
+    fetch_specter2: bool = False,
+    s2_api_key: str = "",
+    max_embed_rows: int = 200,
+    s2_sleep_s: float = 0.35,
+    progress_cb=None,
+    status_cb=None,
+) -> pd.DataFrame:
+    session = requests.Session()
+    headers = {"User-Agent": "streamlit-openalex-search/espresso-v2"}
+
+    cursor = "*"
+    collected = 0
+    page_count = 0
+    rows: List[Dict[str, Any]] = []
+
+    while collected < n_rows:
+        params = build_works_params(
+            cursor=cursor,
+            keyword_query=keyword_query,
+            year_from=year_from,
+            year_to=year_to,
+            api_key=api_key,
+            mailto=mailto,
+            per_page=200,
+            source_ids=source_ids,
+            subfield_ids=subfield_ids,
+            #primary_topic_id=primary_topic_id,
+            primary_topic_ids=primary_topic_ids,
+
+            work_types=work_types,
+            #country_mode=country_mode,
+            countries=countries,
+
+            require_abstract=require_abstract,
+            require_doi=require_doi,
+            include_xpac=include_xpac,
+        )
+
+        r = session.get(WORKS_URL, params=params, headers=headers, timeout=60)
+            # --- CREDIT TRACKING ---
+        try:
+            used = int(r.headers.get("X-RateLimit-Credits-Used", 0))
+            st.session_state["user_credits"] += used
+        except Exception:
+            pass
+
+        r.raise_for_status()
+        data = r.json()
+
+        results = data.get("results", [])
+        cursor = (data.get("meta") or {}).get("next_cursor")
+        page_count += 1
+
+        if status_cb:
+            status_cb(f"Fetched page {page_count} | collected {collected}/{n_rows}")
+
+        if not results:
+            break
+
+        for w in results:
+            doi = w.get("doi") or ""
+            title = w.get("display_name") or ""
+            abstract = invert_index_to_text(w.get("abstract_inverted_index"))
+
+            if not title:
+                continue
+            if require_doi and not doi:
+                continue
+            if require_abstract and not abstract:
+                continue
+
+
+            keywords = [
+                kw.get("display_name", "").strip().lower()
+                for kw in (w.get("keywords") or [])
+                if kw.get("display_name")
+            ]
+
+            country_codes = []
+
+            
+            country_codes = []
+            for auth in (w.get("authorships") or []):
+                for inst in (auth.get("institutions") or []):
+                    cc = inst.get("country_code")
+                    if cc:
+                        country_codes.append(cc)
+
+            country_codes = sorted(set(country_codes))
+            country_str = "; ".join(country_codes)
+
+            selected_countries = set(countries or [])
+
+            corresponding_country_codes = []
+            all_author_country_codes = []
+
+            for auth in (w.get("authorships") or []):
+                auth_inst_codes = []
+                for inst in (auth.get("institutions") or []):
+                    cc = inst.get("country_code")
+                    if cc:
+                        auth_inst_codes.append(cc)
+                        all_author_country_codes.append(cc)
+
+                if auth.get("is_corresponding"):
+                    corresponding_country_codes.extend(auth_inst_codes)
+
+            all_author_country_codes = sorted(set(all_author_country_codes))
+            corresponding_country_codes = sorted(set(corresponding_country_codes))
+
+           
+
+
+
+            row = {
+                "DOI": doi,
+                "Title": title,
+                "Abstract": abstract or "",
+                "keywords": keywords,
+                "Country": country_str,
+                "CorrespondingAuthorCountry": "; ".join(corresponding_country_codes),
+                "PublicationYear": w.get("publication_year"),
+                "PublicationDate": w.get("publication_date"),
+                "JournalOrVenue": safe_get_journal_from_primary_location(w),
+                "JournalSourceID": safe_get_source_id_from_primary_location(w),
+                "WorkType": w.get("type"),
+                "CitedByCount": w.get("cited_by_count"),
+                "CountsByYear": w.get("counts_by_year") or [],
+                "ReferencedWorksCount": w.get("referenced_works_count"),
+                "OpenAlexID": w.get("id"),
+                "OpenAlexURL": w.get("id"),
+            }
+
+            pt = w.get("primary_topic") or {}
+            if isinstance(pt, dict):
+                row["PrimaryTopic"] = pt.get("display_name", "")
+                row["PrimaryTopicID"] = (pt.get("id", "") or "").rsplit("/", 1)[-1]  # Txxxx
+                sf = pt.get("subfield") or {}
+                fld = pt.get("field") or {}
+                dom = pt.get("domain") or {}
+                row["Subfield"] = sf.get("display_name", "") if isinstance(sf, dict) else ""
+                row["Field"] = fld.get("display_name", "") if isinstance(fld, dict) else ""
+                row["Domain"] = dom.get("display_name", "") if isinstance(dom, dict) else ""
+            else:
+                row["PrimaryTopic"] = ""
+                row["Subfield"] = ""
+                row["Field"] = ""
+                row["Domain"] = ""
+
+
+            # Add Top-N topic tags (from OpenAlex work["topics"]) for CSV-friendly export
+            row.update(topics_to_strings(w, top_n=5))
+            rows.append(row)
+            collected += 1
+            if collected >= n_rows:
+                break
+
+        if progress_cb:
+            progress_cb(min(collected / n_rows, 1.0))
+
+        if not cursor:
+            break
+
+        time.sleep(sleep_s)
+
+    df_out = pd.DataFrame(rows)
+    
+    
+
+
+    # Optional: attach SPECTER2 embeddings (currently disabled in UI)
+    if fetch_specter2:
+        try:
+            if status_cb:
+                status_cb(f"Fetching SPECTER2 embeddings for up to {max_embed_rows} rows…")
+            df_out = attach_specter2_to_df(df_out, s2_api_key=s2_api_key, max_rows=max_embed_rows, sleep_s=s2_sleep_s)
+        except Exception as e:
+            if status_cb:
+                status_cb(f"SPECTER2 embedding fetch failed: {e}")
+
+    return df_out
+
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+
+
+# ----------------------------
+# OpenAI / ChatGPT enrichment (safe: only runs on loaded/uploaded data)
+# ----------------------------
+
+def openai_chat_completion(api_key: str, model: str, prompt: str, temperature: float = 0.8, timeout_s: int = 120) -> str:
+    """Call OpenAI Chat Completions API via HTTPS (no openai package required)."""
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json()
+    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+
+
+def parse_key_challenge_review(output: str) -> tuple[str, str]:
+    """Parse 2-line output into (challenge, title). Robust to extra blank lines and prefixes."""
+    if not output:
+        return "", ""
+    lines = [ln.strip() for ln in str(output).splitlines() if ln.strip()]
+    if not lines:
+        return "", ""
+    challenge = lines[0]
+    title = lines[1] if len(lines) > 1 else ""
+
+    for pref in ("Key challenge:", "Key Challenge:", "Challenge:"):
+        if challenge.lower().startswith(pref.lower()):
+            challenge = challenge[len(pref):].strip()
+            break
+
+    for pref in (
+        "Possible Review Title:",
+        "Possible review title:",
+        "Possible Review Article Title:",
+        "Review title:",
+        "Title:",
+    ):
+        if title.lower().startswith(pref.lower()):
+            title = title[len(pref):].strip()
+            break
+
+    return challenge, title
+
+
+def build_input_text_from_row(row: pd.Series, mode: str, custom_col: str = "") -> str:
+    """Build the text sent to ChatGPT from a dataframe row based on mode."""
+    title = str(row.get("Title", "") or row.get("Article Title", "") or "")
+    abstract = str(row.get("Abstract", "") or "")
+
+    if mode == "Title":
+        return title.strip()
+    if mode == "Abstract":
+        return abstract.strip()
+    if mode == "Title + Abstract":
+        if title and abstract:
+            return f"{title}\n\n{abstract}".strip()
+        return (title or abstract).strip()
+    if mode == "Custom column" and custom_col:
+        return str(row.get(custom_col, "") or "").strip()
+
+    # fallback
+    return (title + "\n\n" + abstract).strip()
+
+
+def enrich_df_with_chatgpt(
+    df: pd.DataFrame,
+    top_n: int,
+    api_key: str,
+    model: str,
+    temperature: float,
+    prompt_text: str,
+    preset_name: str,
+    input_mode: str,
+    custom_col: str = "",
+    progress_cb=None,
+) -> pd.DataFrame:
+    """Run ChatGPT on top N rows and add result columns to df."""
+    if df is None or df.empty:
+        return df
+
+    d = df.copy()
+    n = max(1, min(int(top_n), len(d)))
+
+    col_ch = "Key challenge identified by ChatGPT"
+    col_rt = "Possible Review Article Title suggested by ChatGPT"
+    col_other = f"ChatGPT output ({preset_name})"
+
+    if preset_name == "Key challenge / Review":
+        if col_ch not in d.columns:
+            d[col_ch] = pd.NA
+        if col_rt not in d.columns:
+            d[col_rt] = pd.NA
+    else:
+        if col_other not in d.columns:
+            d[col_other] = pd.NA
+
+    for i in range(n):
+        if progress_cb:
+            progress_cb((i + 1) / n)
+
+        row = d.iloc[i]
+        input_text = build_input_text_from_row(row, mode=input_mode, custom_col=custom_col)
+        if not input_text:
+            continue
+
+        prompt = prompt_text.replace("{input_text}", input_text)
+
+        try:
+            out = openai_chat_completion(api_key=api_key, model=model, prompt=prompt, temperature=temperature)
+        except Exception as e:
+            if preset_name == "Key challenge / Review":
+                d.at[d.index[i], col_ch] = f"[ERROR] {e}"
+                d.at[d.index[i], col_rt] = ""
+            else:
+                d.at[d.index[i], col_other] = f"[ERROR] {e}"
+            continue
+
+        if preset_name == "Key challenge / Review":
+            ch, rt = parse_key_challenge_review(out)
+            d.at[d.index[i], col_ch] = ch
+            d.at[d.index[i], col_rt] = rt
+        else:
+            d.at[d.index[i], col_other] = out
+
+    return d
+
+
+
+# ----------------------------
+# Commissioning / Review-topic synthesis (group-level)
+# ----------------------------
+
+def _paper_id_from_row(row: pd.Series) -> str:
+    """Pick a stable paper ID for prompts/traceability."""
+    doi = str(row.get("DOI", "") or "").strip()
+    if doi and doi.lower() not in ("nan", "none"):
+        return doi
+    oa = str(row.get("OpenAlexID", "") or row.get("OpenAlexURL", "") or "").strip()
+    if oa and oa.lower() not in ("nan", "none"):
+        return oa
+    return str(row.name)
+
+
+def _paper_title_from_row(row: pd.Series) -> str:
+    return str(row.get("Title", "") or row.get("Article Title", "") or "").strip()
+
+
+def _paper_abstract_from_row(row: pd.Series) -> str:
+    return str(row.get("Abstract", "") or "").strip()
+
+
+def build_commissioning_prompt(papers: List[Dict[str, str]], min_support: int = 2) -> str:
+    """Build a strict prompt that asks for high-level review topics + search strategies."""
+    # We ask for JSON-only output to make parsing robust.
+    rules = (
+        "You are helping a journal editor commission review articles based on a set of research papers.\n\n"
+        "From the provided list of papers (titles + abstracts), you must:\n"
+        "1) Identify recurring scientific problems, challenges, or methodological gaps\n"
+        "2) Group related papers into coherent topic clusters\n"
+        "3) Propose high-level REVIEW ARTICLE topics (NOT paper-specific summaries)\n"
+        "4) For each topic, design a search strategy that can later be used to check novelty via web search\n\n"
+        "CRITICAL RULES:\n"
+        "- DO NOT propose topics centered on single tools (e.g. 'DeepRTAlign').\n"
+        "- ALWAYS generalize to the underlying problem (e.g. 'retention time alignment in large-scale LC-MS').\n"
+        f"- Each topic must be supported by MULTIPLE papers (minimum {min_support} if possible).\n"
+        "- Avoid trivial or overly broad topics ('proteomics advances', 'AI in biology').\n"
+        "- Focus on topics that could realistically support a full Review article.\n"
+        "- If a topic is widely known, refine it to a specific integrative synthesis angle.\n\n"
+        "OUTPUT FORMAT (JSON ONLY, no markdown, no commentary):\n"
+        "{\n"
+        "  \"topics\": [\n"
+        "    {\n"
+        "      \"topic_title\": string,\n"
+        "      \"problem_gap\": string,\n"
+        "      \"synthesis_angle\": string,\n"
+        "      \"supporting_paper_ids\": [string, ...],\n"
+        "      \"search_strategy\": {\n"
+        "         \"boolean_query\": string,\n"
+        "         \"keywords\": [string, ...],\n"
+        "         \"exclusions\": [string, ...]\n"
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+    )
+
+    lines = [rules, "PAPERS:"]
+    for p in papers:
+        pid = p.get("paper_id", "")
+        title = p.get("title", "")
+        abstract = p.get("abstract", "")
+        lines.append(f"\n[PaperID] {pid}\n[Title] {title}\n[Abstract] {abstract}")
+
+    return "\n".join(lines)
+
+
+def parse_commissioning_json(output: str) -> Dict[str, Any]:
+    """Parse JSON-only model output. Tries to recover if there's leading/trailing text."""
+    if not output:
+        return {}
+    s = output.strip()
+    # Attempt direct JSON parse
+    try:
+        return json.loads(s)
+    except Exception:
+        # Try to extract the first JSON object substring
+        m = re.search(r"\{[\s\S]*\}", s)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return {}
+        return {}
+
+
+def commissioning_run(
+    df: pd.DataFrame,
+    cluster_col: str,
+    cluster_values: List[Any],
+    max_papers: int,
+    input_mode: str,
+    custom_col: str,
+    min_support: int,
+    api_key: str,
+    model: str,
+    temperature: float,
+    progress_cb=None,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """Run commissioning synthesis on a selected subset. Returns (topics_df, support_df, raw_output)."""
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    if cluster_col not in df.columns:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    sub = df[df[cluster_col].isin(cluster_values)].copy()
+    if sub.empty:
+        return pd.DataFrame(), pd.DataFrame(), ""
+
+    # Keep deterministic ordering for now (Top rows) to match your current 'Top N' testing style
+    sub = sub.head(int(max_papers)).copy()
+
+    papers: List[Dict[str, str]] = []
+    for _, row in sub.iterrows():
+        pid = _paper_id_from_row(row)
+        title = _paper_title_from_row(row)
+        abstract = _paper_abstract_from_row(row)
+
+        # Build text sent according to input_mode
+        if input_mode == "Title":
+            txt = title
+        elif input_mode == "Abstract":
+            txt = abstract
+        elif input_mode == "Title + Abstract":
+            txt = (title + "\n\n" + abstract).strip()
+        else:
+            txt = str(row.get(custom_col, "") or "").strip()
+
+        # Truncate to keep prompts bounded
+        txt = txt[:3500]
+
+        papers.append({
+            "paper_id": pid,
+            "title": title[:500],
+            "abstract": txt,
+        })
+
+    prompt = build_commissioning_prompt(papers, min_support=int(min_support))
+
+    raw = openai_chat_completion(api_key=api_key, model=model, prompt=prompt, temperature=temperature)
+
+    data = parse_commissioning_json(raw)
+    topics = data.get("topics") if isinstance(data, dict) else None
+    if not isinstance(topics, list):
+        return pd.DataFrame(), pd.DataFrame(), raw
+
+    # Build outputs
+    topic_rows = []
+    support_rows = []
+
+    # Map id->title for support table
+    id_to_title = {p["paper_id"]: p.get("title", "") for p in papers}
+
+    for t in topics:
+        if not isinstance(t, dict):
+            continue
+        topic_title = str(t.get("topic_title", "")).strip()
+        problem_gap = str(t.get("problem_gap", "")).strip()
+        synth = str(t.get("synthesis_angle", "")).strip()
+        supp = t.get("supporting_paper_ids", [])
+        supp = [str(x).strip() for x in supp] if isinstance(supp, list) else []
+
+        ss = t.get("search_strategy", {}) if isinstance(t.get("search_strategy", {}), dict) else {}
+        boolean_q = str(ss.get("boolean_query", "")).strip()
+        keywords = ss.get("keywords", [])
+        exclusions = ss.get("exclusions", [])
+        if isinstance(keywords, list):
+            keywords_s = "; ".join([str(x).strip() for x in keywords if str(x).strip()])
+        else:
+            keywords_s = ""
+        if isinstance(exclusions, list):
+            exclusions_s = "; ".join([str(x).strip() for x in exclusions if str(x).strip()])
+        else:
+            exclusions_s = ""
+
+        topic_rows.append({
+            "Topic": topic_title,
+            "Problem / gap": problem_gap,
+            "Synthesis angle": synth,
+            "N_support": len(supp),
+            "Supporting IDs": "; ".join(supp),
+            "Search boolean query": boolean_q,
+            "Search keywords": keywords_s,
+            "Search exclusions": exclusions_s,
+        })
+
+        for pid in supp:
+            support_rows.append({
+                "Topic": topic_title,
+                "PaperID": pid,
+                "Paper title": id_to_title.get(pid, ""),
+            })
+
+    topics_df = pd.DataFrame(topic_rows)
+    support_df = pd.DataFrame(support_rows)
+    return topics_df, support_df, raw
+
+st.set_page_config(page_title="Lucie's OpenAlex Sandbox (Concotion ⚗️)", layout="wide")
+st.title("Lucie's Enriched Alex Concoction ⚗️")
+#st.warning(
+#    "🚦 **Usage note:** This app is a draft for exploration and prototyping. "
+#    "Please avoid fetching tens of thousands of records in one go without an API key. We do not want to get blocked."
+#    "Start small (e.g., **500–2,000**) and only increase if necessary. "
+#    "Tip: export once and save to your harddrive, you can also manually clean up and then work from **Upload CSV** to avoid re-querying OpenAlex."
+#    "I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
+#    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles. "
+#)
+
+st.warning(
+"🚦 **Usage note:** Each page (page = up to 200 rows) of OpenAlex results consumes API credits. Large queries and repeated searches can quickly use up the shared daily quota (for this app, no matter who uses it).\n\n"
+"👉 Start small (500–2,000 records) and increase only if needed."
+"👉 Export results and reuse via Upload CSV to avoid repeated API calls."
+"👉 For regular or heavy use, please get your own free OpenAlex API key."
+)
+
+st.info(
+"ℹ️ Credit usage depends on how many requests (“pages”) are needed. "
+"Since each page returns up to ~200 results, larger result sets require more pages and consume more credits." )
+
+
+st.warning(
+    "⚠️I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
+    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles.⚠️ "
+)
+
+with st.sidebar:
+    st.header("Inputs")
+
+    data_source = st.radio(
+        "Data source",
+        ["Fetch from OpenAlex", "Upload CSV", "Use loaded data"],
+        index=0,
+        help="Upload mode loads a previously exported CSV and does not apply OpenAlex search filters (by design)."
+    )
+
+    st.subheader("API (optional)")
+    api_key = st.text_input("OpenAlex API key (optional)", value="", type="password")
+    mailto = st.text_input("Contact email (optional)", value="")
+
+    uploaded_file = None
+    if data_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload app-exported CSV", type=["csv"])
+
+    # Fetch-mode controls
+    if data_source == "Fetch from OpenAlex":
+        st.subheader("Query")
+        keyword_query = st.text_area("Keyword / phrase query (Boolean allowed; can be empty)", value="", height=70)
+
+        st.markdown("### Work type")
+
+        work_types = st.multiselect(
+            "Select work type(s)",
+           options=[
+                "article",
+                "book",
+                "book-chapter",
+                "dataset",
+                "dissertation",
+                "editorial",
+                "erratum",
+                "letter",
+                "libguides",
+                "other",
+                "paratext",
+                "peer-review",
+                "preprint",
+                "reference-entry",
+                "report",
+                "retraction",
+                "review",
+                "standard",
+                "supplementary-materials",
+            ],
+            default=["article"],  # ✅ keeps reviews OUT by default
+            key="work_types"
+        )
+
+        st.markdown("### Country filter")
+
+       # --- Country list (ISO2 → name) ---
+        COUNTRIES = {
+            "US": "United States",
+            "GB": "United Kingdom",
+            "DE": "Germany",
+            "FR": "France",
+            "IT": "Italy",
+            "ES": "Spain",
+            "CA": "Canada",
+            "AU": "Australia",
+            "NL": "Netherlands",
+            "BE": "Belgium",
+            "CH": "Switzerland",
+            "AT": "Austria",
+            "SE": "Sweden",
+            "NO": "Norway",
+            "DK": "Denmark",
+            "FI": "Finland",
+            "IE": "Ireland",
+            "PT": "Portugal",
+            "PL": "Poland",
+            "CZ": "Czech Republic",
+            "HU": "Hungary",
+            "RO": "Romania",
+            "GR": "Greece",
+            "TR": "Turkey",
+            "CN": "China",
+            "JP": "Japan",
+            "KR": "South Korea",
+            "IN": "India",
+            "BR": "Brazil",
+            "MX": "Mexico",
+            "ZA": "South Africa",
+            "SG": "Singapore",
+            "HK": "Hong Kong",
+            "TW": "Taiwan",
+            "NZ": "New Zealand",
+        }
+
+        st.caption("Filter includes works with at least one author affiliated with selected country")
+        
+        if "country_labels_saved" not in st.session_state:
+                    st.session_state.country_labels_saved = []
+      
+        #_country_labels = widget key (ephemeral / tied to rendering)
+        #country_labels_saved = persistent app state (survives when widget disappears
+        country_labels = st.multiselect(
+            "Select country/countries",
+            options=[f"{name} ({code})" for code, name in COUNTRIES.items()],
+            key="_country_labels",
+            default=st.session_state.country_labels_saved,
+            on_change=save_country_labels,
+        )
+
+
+        # convert back to ISO2 codes
+        countries = [label.split("(")[-1].strip(")") for label in country_labels]
+        ## ✅ use widget if available, fallback to session_state otherwise
+        #if country_labels:
+        #    countries = [label.split("(")[-1].strip(")") for label in country_labels]
+        #else:
+        #    country_labels = st.session_state.get("country_labels", [])
+        #    countries = [label.split("(")[-1].strip(")") for label in country_labels]
+
+
+
+
+        st.subheader("Journal filter")
+        journal_lookup = st.text_input('Journal lookup (e.g., "Nature")', value="")
+        find_journals = st.button("Find journals")
+
+        # store found journals (current search results)
+        if "source_candidates" not in st.session_state:
+            st.session_state.source_candidates = []
+
+        # persistent journal selections across multiple searches
+        # dict: source_id -> label
+        if "selected_journals" not in st.session_state:
+            st.session_state.selected_journals = {}
+
+        # nonce counters to force widget re-instantiation (avoids StreamlitAPIException)
+        if "journals_add_nonce" not in st.session_state:
+            st.session_state.journals_add_nonce = 0
+        if "journals_remove_nonce" not in st.session_state:
+            st.session_state.journals_remove_nonce = 0
+
+        ##### Adding in _JungleBird
+        # --- Topic basket state ---
+        if "topic_basket" not in st.session_state:
+            st.session_state.topic_basket = {}  # {id: label}
+
+        #if "topic_applied_ids" not in st.session_state:
+        #    st.session_state.topic_applied_ids = []
+
+        #if "topic_filter_applied" not in st.session_state:
+        #    st.session_state.topic_filter_applied = False
+        
+        #### end addition
+
+               
+
+
+        if find_journals:
+            try:
+                st.session_state.source_candidates = find_sources_by_name(
+                    journal_lookup,
+                    api_key=api_key,
+                    mailto=mailto,
+                    max_results=25,
+                )
+            except Exception as e:
+                st.session_state.source_candidates = []
+                st.error(f"Journal search error: {e}")
+
+        # Build option tuples for current search results
+        search_options = []
+        for s in st.session_state.source_candidates:
+            sid = source_id_short(s.get("id", ""))
+            if not sid:
+                continue
+            name = s.get("display_name", "")
+            org = s.get("host_organization_name", "")
+            issn_l = s.get("issn_l", "")
+            typ = s.get("type", "")
+            label = f"{name} | {org} | ISSN-L: {issn_l} | type: {typ}".strip()
+            search_options.append((sid, label))
+
+        # 1) Add journals from latest search into the persistent selection
+        if search_options:
+            picked_to_add = st.multiselect(
+                "Search results (select journals to add)",
+                options=search_options,
+                format_func=lambda x: x[1],
+                key=f"journals_add_multiselect_{st.session_state.journals_add_nonce}",
+            )
+            col_add1, col_add2 = st.columns([1, 1])
+            with col_add1:
+                add_btn = st.button("Add selected", key="journals_add_btn")
+            with col_add2:
+                clear_results_btn = st.button("Clear search results", key="journals_clear_results_btn")
+
+            if add_btn and picked_to_add:
+                for sid, label in picked_to_add:
+                    st.session_state.selected_journals[sid] = label
+                # bump nonce to clear the multiselect on rerun
+                st.session_state.journals_add_nonce += 1
+                st.rerun()
+
+            if clear_results_btn:
+                st.session_state.source_candidates = []
+                st.session_state.journals_add_nonce += 1
+                st.rerun()
+
+        # 2) Show persistent selection and allow removing
+        selected_source_ids: List[str] = []
+        sel_items = sorted(st.session_state.selected_journals.items(), key=lambda x: x[1])
+        if sel_items:
+            st.markdown("**Selected journals (persistent across searches)**")
+            sel_options = [(sid, label) for sid, label in sel_items]
+
+            picked_to_remove = st.multiselect(
+                "Selected journals (select to remove)",
+                options=sel_options,
+                format_func=lambda x: x[1],
+                key=f"journals_remove_multiselect_{st.session_state.journals_remove_nonce}",
+            )
+            col_rm1, col_rm2 = st.columns([1, 1])
+            with col_rm1:
+                rm_btn = st.button("Remove selected", key="journals_remove_btn")
+            with col_rm2:
+                clear_all_btn = st.button("Clear all selected", key="journals_clear_all_btn")
+
+            if rm_btn and picked_to_remove:
+                for sid, _label in picked_to_remove:
+                    st.session_state.selected_journals.pop(sid, None)
+                st.session_state.journals_remove_nonce += 1
+                st.rerun()
+
+            if clear_all_btn:
+                st.session_state.selected_journals = {}
+                st.session_state.journals_remove_nonce += 1
+                st.rerun()
+
+            selected_source_ids = list(st.session_state.selected_journals.keys())
+        else:
+            st.caption("No journals selected yet. Use the search box above and click **Add selected**.")
+
+        st.subheader("Subfield filter (OpenAlex taxonomy)")
+        #subfields_df = fetch_all_subfields(api_key=api_key, mailto=mailto)
+        try:
+            subfields_df = fetch_all_subfields(
+                api_key=api_key,
+                mailto=mailto
+            )
+        except Exception as e:
+            st.warning(
+                f"OpenAlex subfield taxonomy unavailable ({e}). "
+                "Subfield filtering disabled."
+            )
+            subfields_df = pd.DataFrame(columns=["label", "subfield_id"])
+        subfield_choices = st.multiselect(
+            "Subfield(s) (3rd level) — optional",
+            options=(subfields_df["label"].tolist() if not subfields_df.empty else []),
+            default=[],
+            help="Select one or more OpenAlex subfields. Multiple subfields are combined with OR in the OpenAlex filter.",
+        )
+        subfield_ids: List[str] = []
+        if subfield_choices and not subfields_df.empty:
+            subfield_ids = (
+                subfields_df.loc[subfields_df["label"].isin(subfield_choices), "subfield_id"]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+
+        #### new in _iceberg: Primary Topic filter
+        #st.markdown("### Primary Topic filter (OpenAlex ID)")
+
+        st.markdown("### Primary Topic filter")
+
+        topic_query = st.text_input(
+            "Search Primary Topic",
+            placeholder="Type e.g. proteomics, CRISPR, metabolomics...",
+        )
+
+        topic_results = []
+        topic_options = {}
+
+        if topic_query.strip():
+            topic_results = search_topics(topic_query, api_key=api_key, mailto=mailto)
+
+            for t in topic_results:
+                name = t.get("display_name", "Unknown")
+                tid = (t.get("id") or "").split("/")[-1]
+
+                label = f"{name} ({tid})"
+                topic_options[label] = tid
+
+        selected_topic_labels = st.multiselect(
+            "Select Primary Topic(s)",
+            options=list(topic_options.keys()),
+        )
+
+        ################ Adding in _JungleBird
+        # --- build label → ID mapping (reuse your existing logic) ---
+        topic_options = {}
+        for t in topic_results:
+            name = t.get("display_name", "Unknown")
+            tid = (t.get("id") or "").split("/")[-1]
+            if tid:
+                label = f"{name} ({tid})"
+                topic_options[label] = tid
+
+        # convert current selection → IDs
+        current_selected_ids = [
+            topic_options[label] for label in selected_topic_labels
+        ] if selected_topic_labels else []
+
+
+        # --- buttons ---
+        colA, colB = st.columns(2)
+
+        with colA:
+            add_clicked = st.button("➕ Add to basket", use_container_width=True)
+
+       # with colB:
+       #     apply_clicked = st.button("✅ Apply to search", use_container_width=True)
+
+
+        # --- add to basket ---
+        if add_clicked and current_selected_ids:
+            for label in selected_topic_labels:
+                tid = topic_options[label]
+                st.session_state.topic_basket[tid] = label  # dedupe by ID
+            
+            ### adding fix after patches 
+        # 🚨 IMPORTANT: invalidate previous applied state
+          #  st.session_state.topic_filter_applied = False
+
+
+
+        # --- apply basket ---
+        #if apply_clicked:
+        #    st.session_state.topic_applied_ids = list(st.session_state.topic_basket.keys())
+        #    st.session_state.topic_filter_applied = True
+
+        ############### end patch 2
+
+        ### Fix 1 after patches 1-4
+        # --- status feedback ---
+       # if st.session_state.topic_filter_applied:
+       #     st.success(f"✅ Topic filter ACTIVE ({len(st.session_state.topic_applied_ids)} topics)")
+       # else:
+       #     st.warning("⚠️ Topic filter NOT applied yet — click 'Apply topics' before Fetch")
+
+            ### end fix
+
+        #### 
+        st.caption(f"Selected topics in basket: {len(st.session_state.topic_basket)}")
+
+        # --- Topic basket display ---
+        if st.session_state.topic_basket:
+            st.write(list(st.session_state.topic_basket.values()))
+
+            if st.button("🧹 Clear basket"):
+                st.session_state.topic_basket = {}
+                st.rerun()
+
+        # status
+        if st.session_state.topic_basket:
+            st.info(f"🎯 Filtering by {len(st.session_state.topic_basket)} topic(s)")
+        else:
+            st.info("No Primary Topic filter applied")
+
+        ##### Replacing this with Patch 4
+
+
+        
+        primary_topic_ids = (
+            list(st.session_state.topic_basket.keys())
+            if st.session_state.topic_basket
+            else None
+        )
+
+
+        if st.session_state.topic_basket:
+            st.info(f"🎯 Topic filter ACTIVE ({len(st.session_state.topic_basket)} topics)")
+        else:
+            st.info("No Primary Topic filter applied")
+
+        ####
+
+        st.subheader("Year range")
+        year_from_val, year_to_val = st.slider("Publication years", min_value=2010, max_value=2030, value=(2023, 2026), step=1)
+
+        st.subheader("Coverage toggles")
+        include_xpac = st.checkbox("Include xpac (expansion pack) works", value=True)
+        require_doi = st.checkbox("Require DOI", value=True)
+        require_abstract = st.checkbox("Require abstract", value=True)
+
+        st.subheader("Sampling")
+        n_rows = st.number_input("Rows to collect", min_value=100, max_value=50000, value=5000, step=500)
+
+        st.subheader("Citations by year")
+        include_citations_by_year = st.checkbox("Add citations by year columns", value=False)
+        cite_year_from = st.number_input("Cite year from", 2010, 2031, 2023)
+        cite_year_to = st.number_input("Cite year to", 2010, 2031, 2027)
+
+        # SPECTER2 toggle (disabled for now)
+        st.subheader("Embeddings (optional)")
+        fetch_specter2 = st.checkbox("Fetch SPECTER2 embeddings (disabled for testing)", value=False, disabled=False)
+        s2_api_key = st.text_input("Semantic Scholar API key (disabled)", value="", type="password", disabled=False)
+        max_embed_rows = st.number_input("Max rows to embed (disabled)", min_value=10, max_value=6000, value=200, step=50, disabled=False)
+        s2_sleep_s = st.slider("Sleep between S2 requests (s) (disabled)", 0.0, 2.0, 0.35, 0.05, disabled=False)
+
+        st.subheader("Politeness")
+        sleep_s = st.slider("Sleep between OpenAlex requests (s)", 0.0, 1.0, 0.2, 0.05)
+
+        go = st.button("Fetch dataset", type="primary")
+
+        #if st.session_state.topic_basket and not st.session_state.topic_filter_applied:
+        #    st.warning("⚠️ Basket contains topics but filter NOT applied")
+
+# Session storage
+if "df" not in st.session_state:
+    st.session_state.df = None
+
+# Upload path
+if data_source == "Upload CSV" and uploaded_file is not None:
+    try:
+        df_up = pd.read_csv(uploaded_file, low_memory=False)
+        st.session_state.df = df_up
+        st.success(f"Loaded uploaded CSV with {len(df_up):,} rows")
+    except Exception as e:
+        st.session_state.df = None
+        st.error(f"Upload failed: {e}")
+
+# Fetch path
+if data_source == "Fetch from OpenAlex" and 'go' in globals() and go:
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    primary_topic_ids = (
+        list(st.session_state.topic_basket.keys())
+        if st.session_state.topic_basket
+        else None
+    )
+
+    try:
+        with st.spinner("Querying OpenAlex…"):
+            df = fetch_works(
+                n_rows=int(n_rows),
+                keyword_query=keyword_query,
+                year_from=int(year_from_val),
+                year_to=int(year_to_val),
+                api_key=api_key,
+                mailto=mailto,
+                sleep_s=float(sleep_s),
+                source_ids=selected_source_ids or None,
+                subfield_ids=subfield_ids or None,
+                #primary_topic_id=primary_topic_id.strip() or None,
+                primary_topic_ids=primary_topic_ids,
+                require_abstract=require_abstract,
+                require_doi=require_doi,
+                include_xpac=include_xpac,
+                progress_cb=progress.progress,
+                status_cb=status.write,
+                fetch_specter2=fetch_specter2,
+                s2_api_key=s2_api_key,
+                max_embed_rows=int(max_embed_rows),
+                s2_sleep_s=float(s2_sleep_s),
+                work_types=work_types,          # ✅ ADDED
+                #country_mode=country_mode,
+                countries=countries             # ✅ ADDED
+
+            )
+
+            if include_citations_by_year:
+                y1, y2 = int(cite_year_from), int(cite_year_to)
+                if y1 <= y2:
+                    years = list(range(y1, y2 + 1))
+                    df = add_citations_by_year_columns(df, years, src_col="CountsByYear", drop_src=True)
+
+        st.session_state.df = df
+        status.success(f"Done. Collected {len(df):,} rows.")
+        st.success(f"✅ You have used ~{st.session_state['user_credits']} credits in this session")
+        
+    except Exception as e:
+        st.session_state.df = None
+        status.error(f"Error: {e}")
+
+
+#df = st.session_state.df
+#df_raw = st.session_state.df
+#df = df_raw.copy()
+
+df_raw = st.session_state.df
+
+if df_raw is not None:
+    df = df_raw.copy()
+else:
+    df = None
+
+country_labels = st.session_state.country_labels_saved
+countries = [label.split("(")[-1].strip(")") for label in country_labels]
+
+country_mode = st.session_state.get("country_mode", "Any author (default)")
+
+#country_mode = "Any author (default)"   # ✅ safe default
+#countries = []
+
+if df is None or df.empty:
+    st.info("No dataset loaded yet. Fetch from OpenAlex or upload a CSV.")
+    st.stop()
+
+# ----------------------------
+# Tabs
+# ----------------------------
+
+
+
+# --- REFACTORED WORKSPACE NAVIGATION TABS ---
+tab_preview, tab_growth, tab_impact, tab_enrichment, tab_lexical, tab_mesh, tab_chatgpt, tab_commissioning, tab_copilot, tab_download = st.tabs([
+    "📄 Loaded data",
+    "🟩 Treemap (Topics growth)",
+    "🟧 Treemap (Impact)",
+    "📊 Enrichment bubble",
+    "🧭 Lexical Mapping",      # 👈 NEW INTERACTIVE TAB 
+    "🕸️ Community Mesh",       # 👈 NEW INTERACTIVE TAB
+    "🤖 ChatGPT",
+    "🧠 Commissioning",
+    "🕵️ Copilot",
+    "⬇ Download",
+])
+
+
+with tab_preview:
+    st.subheader("Preview")
+
+    st.markdown("### Country mode")
+
+    st.caption("Controls how country filter is applied to authorships")
+        
+    country_mode = st.radio(
+            "How should country filter be applied?",
+            options=[
+                "Any author (default)",
+                "Corresponding author only",
+                "All authors from selected countries"
+            ],
+            index=0,
+            key="country_mode" 
+        )
+
+
+    #df_filtered = df   # ✅ NEW LINE
+
+    # --- APPLY COUNTRY MODE FILTER ---
+    if df is not None and not df.empty and len(countries) > 0 and country_mode != "Any author (default)":
+
+        selected = set(countries)
+
+        if country_mode == "Corresponding author only":
+            df = df[
+                df["CorrespondingAuthorCountry"]
+                .fillna("")
+                .apply(lambda s: bool(set([x.strip() for x in s.split(";") if x.strip()]) & selected))
+            ].copy()
+
+        elif country_mode == "All authors from selected countries":
+            df = df[
+                df["Country"]
+                .fillna("")
+                .apply(
+                    lambda s: (
+                        len([x.strip() for x in s.split(";") if x.strip()]) > 0 and
+                        set([x.strip() for x in s.split(";") if x.strip()]).issubset(selected)
+                    )
+                )
+            ].copy()
+
+       
+
+    # ✅ SHOW FILTERED DATA
+    #st.dataframe(df_filtered.head(50), use_container_width=True)
+
+    st.dataframe(df.head(50), use_container_width=True)
+
+    if "Abstract" in df.columns:
+        abs_cov = (df["Abstract"].fillna("").astype(str).str.strip().str.len() > 0).mean()
+        st.caption(f"Abstract coverage: {abs_cov:.1%}")
+
+    # --- FULL DATASET STATS ---
+    if df_raw is not None:
+
+        st.markdown("**Full dataset**")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Rows", f"{len(df_raw):,}")
+        c2.metric("Unique DOIs", f"{df_raw['DOI'].nunique():,}" if "DOI" in df_raw.columns else "—")
+
+        if "PublicationYear" in df_raw.columns:
+            ys = pd.to_numeric(df_raw["PublicationYear"], errors="coerce")
+            c3.metric("Year min", f"{int(ys.min())}" if ys.notna().any() else "—")
+            c4.metric("Year max", f"{int(ys.max())}" if ys.notna().any() else "—")
+
+    # --- FILTERED DATASET STATS ---
+    if df is not None:
+
+        st.markdown("**Filtered dataset**")
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric("Rows", f"{len(df):,}")
+        c2.metric("Unique DOIs", f"{df['DOI'].nunique():,}" if "DOI" in df.columns else "—")
+
+        if "PublicationYear" in df.columns:
+            ys = pd.to_numeric(df["PublicationYear"], errors="coerce")
+
+
+      
+    
+    st.download_button(
+    label="⬇ Download dataset (CSV)",
+    data=df.to_csv(index=False).encode("utf-8"),
+    file_name=f"openalex_dataset_{len(df)}.csv",
+    mime="text/csv",
+            )
+
+
+with tab_growth:
+    st.subheader("Treemap by Primary Topic (Growth)")
+    st.caption("Size = number of papers in dataset. Color = growth over selected years.")
+
+    if "PrimaryTopic" not in df.columns or "PublicationYear" not in df.columns:
+        st.warning("Need 'PrimaryTopic' and 'PublicationYear' columns.")
+    else:
+        year_series = pd.to_numeric(df["PublicationYear"], errors="coerce")
+        year_series = year_series.dropna().astype(int)
+        if year_series.empty:
+            st.warning("PublicationYear has no valid numeric values.")
+        else:
+            y_min, y_max = int(year_series.min()), int(year_series.max())
+
+            colA, colB, colC = st.columns([1, 1, 1])
+            with colA:
+                start_year = st.number_input("Growth start year", min_value=1900, max_value=2100, value=max(y_min, y_max - 1), step=1)
+            with colB:
+                end_year = st.number_input("Growth end year", min_value=1900, max_value=2100, value=y_max, step=1)
+            with colC:
+                metric = st.selectbox("Color metric", ["CAGR", "SlopePerYear"], index=0)
+
+            colD, colE = st.columns([1, 1])
+            with colD:
+                smoothing = st.slider("CAGR smoothing", 0.0, 5.0, 1.0, 0.5)
+            with colE:
+                min_total = st.number_input("Minimum topic size (N_total)", min_value=1, max_value=5000, value=5, step=1)
+
+            tbl = compute_topic_growth_table(
+                df=df,
+                topic_col="PrimaryTopic",
+                year_col="PublicationYear",
+                start_year=int(start_year),
+                end_year=int(end_year),
+                smoothing=float(smoothing),
+                min_total=int(min_total),
+            )
+
+            if tbl.empty:
+                st.info("No topics available after filtering.")
+            else:
+                fig = px.treemap(
+                    tbl,
+                    path=["Topic"],
+                    values="N_total",
+                    color=metric,
+                    hover_data={
+                        "N_total": True,
+                        "N_start": True,
+                        "N_end": True,
+                        "Delta": True,
+                        "CAGR": ":.2%",
+                        "SlopePerYear": ":.2f",
+                    },
+                    color_continuous_scale="RdBu_r",
+                )
+                # Center diverging scale at 0
+                fig.update_layout(coloraxis_cmid=0, margin=dict(t=30, l=5, r=5, b=5))
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Download interactive HTML (Growth treemap)
+                growth_html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+                st.download_button(
+                    label="⬇ Download growth treemap (HTML, interactive)",
+                    data=growth_html.encode("utf-8"),
+                    file_name= f"growth_{metric}_{int(start_year)}-{int(end_year)}.html",   #"growth_treemap.html",
+                    mime="text/html",
+)
+
+
+with tab_impact:
+    st.subheader("Treemap by Primary Topic (Impact)")
+    st.caption("Size = number of papers. Color = impact (citations per paper).")
+
+    if "PrimaryTopic" not in df.columns:
+        st.warning("Need 'PrimaryTopic' column.")
+    else:
+        col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+        with col1:
+            impact_mode = st.selectbox("Impact type", ["All-time", "IF-window (year X to X-1/X-2)"], index=0)
+        with col2:
+            agg_mode = st.selectbox("Aggregation", ["Mean", "Median"], index=0)
+        with col3:
+            min_topic_size = st.number_input("Min papers per topic", min_value=1, value=5, step=1)
+        with col4:
+            grey_small = st.checkbox("Grey small/undefined topics", value=True)
+
+        tbl = None
+        if impact_mode == "All-time":
+            tbl = compute_topic_impact_table_alltime(df, agg=agg_mode, min_n=int(min_topic_size))
+        else:
+            # Evaluation year X must be explicitly chosen; use available year columns in df
+            year_cols = sorted([c for c in df.columns if str(c).isdigit()])
+            if not year_cols:
+                st.info("No citation-by-year columns present. Enable 'Add citations by year columns' when fetching, or upload a file that includes year columns.")
+                tbl = pd.DataFrame(columns=["Topic", "N", "Impact", "IsSmall"])
+            else:
+                X = int(st.selectbox("Evaluation year X", options=year_cols, index=max(0, len(year_cols) - 2)))
+                tbl = compute_topic_impact_table_ifwindow(df, X=X, agg=agg_mode, min_n=int(min_topic_size))
+
+        if tbl is None or tbl.empty:
+            st.info("No impact values available for the chosen settings.")
+        else:
+            # Use None for greyed topics if requested
+            plot_tbl = tbl.copy()
+            if grey_small and "IsSmall" in plot_tbl.columns:
+                plot_tbl.loc[plot_tbl["IsSmall"], "Impact"] = None
+
+            fig = px.treemap(
+                plot_tbl,
+                path=["Topic"],
+                values="N",
+                color="Impact",
+                color_continuous_scale="RdBu_r",
+                hover_data={"N": True, "Impact": True},
+            )
+            fig.update_layout(margin=dict(t=30, l=5, r=5, b=5))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Download interactive HTML only
+            html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+            st.download_button(
+                label="⬇ Download impact treemap (HTML, interactive)",
+                data=html.encode("utf-8"),
+                file_name="impact_treemap.html",
+                mime="text/html",
+            )
+
+
+
+
+
+with tab_enrichment:
+    st.subheader("Enrichment bubble chart")
+    st.caption("Ported from ClusterViz. Bubble size = number of papers in the selected group. X = selected numeric metric. Color = enrichment of a selected value compared with its baseline share in the displayed dataset/year.")
+
+    if df is None or df.empty:
+        st.info("No dataset loaded.")
+    else:
+        available_cols = df.columns.tolist()
+        numeric_cols = _infer_numeric_columns(df)
+
+        default_group_col = "PrimaryTopic" if "PrimaryTopic" in available_cols else available_cols[0]
+        default_metric_col = "CitedByCount" if "CitedByCount" in numeric_cols else (numeric_cols[0] if numeric_cols else "")
+
+        preferred_target_cols = [
+            "Journal", "Source", "SourceDisplayName", "SourceTitle", "Venue", "PrimaryTopic", "WorkType", "OpenAccessStatus"
+        ]
+        default_target_col = next((c for c in preferred_target_cols if c in available_cols), default_group_col)
+
+        year_col = "PublicationYear" if "PublicationYear" in available_cols else ""
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            group_col = st.selectbox(
+                "Group rows by",
+                options=available_cols,
+                index=available_cols.index(default_group_col),
+                help="This becomes the y-axis. For the current OpenAlex app, PrimaryTopic is usually the most useful choice."
+            )
+        with c2:
+            if numeric_cols:
+                metric_col = st.selectbox(
+                    "X-axis metric",
+                    options=numeric_cols,
+                    index=numeric_cols.index(default_metric_col) if default_metric_col in numeric_cols else 0,
+                )
+                metric_agg = st.radio("Metric aggregation", options=["Mean", "Median"], horizontal=True)
+            else:
+                metric_col = ""
+                metric_agg = "Mean"
+                st.warning("No numeric columns found for the x-axis metric.")
+        with c3:
+            if year_col:
+                years = pd.to_numeric(df[year_col], errors="coerce").dropna().astype(int).sort_values().unique().tolist()
+                year_options = ["All years"] + years
+                selected_year_label = st.selectbox("Year", options=year_options, index=0)
+                selected_year = None if selected_year_label == "All years" else int(selected_year_label)
+            else:
+                selected_year = None
+                st.info("No PublicationYear column found; using all rows.")
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            target_col = st.selectbox(
+                "Enrichment target column",
+                options=available_cols,
+                index=available_cols.index(default_target_col),
+                help="Choose the column containing the value whose enrichment you want to test, e.g. Journal/Source, WorkType, OpenAccessStatus, PrimaryTopic."
+            )
+        with c5:
+            target_values = _ordered_value_options(df[target_col], max_values=250)
+            if target_values:
+                target_value = st.selectbox("Target value", options=target_values, index=0)
+            else:
+                target_value = st.text_input("Target value", value="")
+        with c6:
+            target_match_mode = st.radio(
+                "Target matching",
+                options=["Exact value", "Contains text"],
+                horizontal=True,
+                help="Use 'Contains text' for columns with semicolon-separated or long text values."
+            )
+
+        c7, c8 = st.columns(2)
+        with c7:
+            min_group_size = st.number_input("Minimum group size", min_value=1, max_value=max(1, len(df)), value=min(5, max(1, len(df))), step=1)
+        with c8:
+            enrichment_method = st.selectbox(
+                "Color metric",
+                options=["Fold enrichment (share ratio)", "Share difference (pp)", "Raw share"],
+                index=0,
+            )
+
+        if not metric_col:
+            st.stop()
+
+        enrich_df = compute_openalex_enrichment_table(
+            df=df,
+            group_col=group_col,
+            target_col=target_col,
+            target_value=target_value,
+            metric_col=metric_col,
+            metric_agg=metric_agg,
+            enrichment_method=enrichment_method,
+            min_group_size=int(min_group_size),
+            year_col=year_col,
+            selected_year=selected_year,
+            target_match_mode=target_match_mode,
+        )
+
+        if enrich_df.empty:
+            st.warning("No groups to plot after the current filters/minimum group-size threshold.")
+        else:
+            year_part = f"{selected_year}" if selected_year is not None else "all years"
+            title = f"{metric_agg} {metric_col} by {group_col} ({year_part}) — enrichment of {target_col}: {target_value}"
+            colorbar_title = enrichment_method.replace(" (share ratio)", "")
+            fig = make_openalex_enrichment_bubble_fig(
+                enrich_df,
+                title=title,
+                x_axis_title=f"{metric_agg} {metric_col}",
+                colorbar_title=colorbar_title,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            html_bytes = fig.to_html(
+                full_html=True,
+                include_plotlyjs="cdn"
+            ).encode("utf-8")
+
+            st.download_button(
+                "⬇ Download chart as HTML",
+                data=html_bytes,
+                file_name="enrichment_bubble_chart.html",
+                mime="text/html",
+            )
+
+            st.markdown("### Enrichment table")
+            st.dataframe(enrich_df.sort_values("enrichment", ascending=False), use_container_width=True)
+            st.download_button(
+                "Download enrichment table CSV",
+                data=enrich_df.to_csv(index=False).encode("utf-8"),
+                file_name="openalex_enrichment_bubble_table.csv",
+                mime="text/csv",
+            )
+
+# ----------------------------------------------------
+# NEW INTERACTIVE WORKSPACE: LEXICAL CLUSTERING MAPS
+# ----------------------------------------------------
+with tab_lexical:
+    st.subheader("⚡ Real-Time Editorial Topic Discovery Engine")
+    st.caption("Zero-dense-embedding matrix pipeline for rapid special issue tracking and lead commissioning.")
+    
+    num_clusters_c = st.slider("Number of Lexical Clusters", 3, 300, 6, key="plugin_num_clusters")
+    
+    if df is not None and not df.empty:
+        with st.spinner("Calculating similarity matrices on the fly..."):
+            working_df = df.copy()
+            if "Abstract" not in working_df.columns:
+                working_df["Abstract"] = ""
+            working_df["Abstract"] = working_df["Abstract"].fillna("")
+            working_df["_combined_text_"] = working_df["Title"].astype(str) + ". " + working_df["Abstract"].astype(str)
+            
+            # Reconstruct OpenAlex keywords arrays or fallback safely
+            all_keywords_lists = []
+            parsed_keywords_text = []
+            for idx, row in working_df.iterrows():
+                kws = []
+                if "keywords" in working_df.columns and isinstance(row["keywords"], list):
+                    kws = [str(k).lower() for k in row["keywords"] if k]
+                elif "TopicsTopN" in working_df.columns and isinstance(row["TopicsTopN"], str):
+                    kws = [k.strip().lower() for k in row["TopicsTopN"].split(";") if k.strip()]
+                all_keywords_lists.append(kws)
+                parsed_keywords_text.append(" ".join([k.replace(" ", "_") for k in kws]))
+                
+            working_df["_keywords_list_"] = all_keywords_lists
+            working_df["_keywords_text_"] = parsed_keywords_text
+
+            # --- MAP A: ABSTRACT CONTENT TOPOGRAPHY ---
+            st.markdown("### Map A: Content Topography Mapping (Raw Abstract Prose)")
+            vec_text = TfidfVectorizer(stop_words='english', max_features=2500, min_df=2)
+            tfidf_text = vec_text.fit_transform(working_df["_combined_text_"])
+            
+            svd_text = TruncatedSVD(n_components=2, random_state=42)
+            coords_text = svd_text.fit_transform(tfidf_text)
+            working_df["x_text"] = coords_text[:, 0]
+            working_df["y_text"] = coords_text[:, 1]
+            
+            kmeans_text = MiniBatchKMeans(n_clusters=num_clusters_c, batch_size=100, random_state=42)
+            working_df["cluster_text"] = kmeans_text.fit_predict(tfidf_text)
+            
+            terms_text = vec_text.get_feature_names_out()
+            labels_text = {}
+            for i in range(num_clusters_c):
+                center = kmeans_text.cluster_centers_[i]
+                top_idx = center.argsort()[-4:][::-1]
+                labels_text[i] = f"Abstract Cluster {i}: " + ", ".join([terms_text[idx] for idx in top_idx])
+            working_df["Abstract Topic Label"] = working_df["cluster_text"].map(labels_text)
+            
+            fig_text = px.scatter(
+                working_df, x="x_text", y="y_text", color="Abstract Topic Label",
+                hover_data=["Title", "PublicationYear"] if "PublicationYear" in working_df.columns else ["Title"],
+                template="plotly_white"
+            )
+            st.plotly_chart(fig_text, use_container_width=True)
+
+            # --- MAP B: METADATA CLASSIFICATION ---
+            st.markdown("---")
+            st.markdown("### Map B: Metadata Classification Mapping (OpenAlex Index Identifiers)")
+            vec_kw = TfidfVectorizer(max_features=2500, min_df=1, token_pattern=r'(?u)\b\w+\b')
+            tfidf_kw = vec_kw.fit_transform(working_df["_keywords_text_"])
+            
+            svd_kw = TruncatedSVD(n_components=2, random_state=42)
+            coords_kw = svd_kw.fit_transform(tfidf_kw)
+            working_df["x_kw"] = coords_kw[:, 0]
+            working_df["y_kw"] = coords_kw[:, 1]
+            
+            kmeans_kw = MiniBatchKMeans(n_clusters=num_clusters_c, batch_size=100, random_state=42)
+            working_df["cluster_kw"] = kmeans_kw.fit_predict(tfidf_kw)
+            
+            terms_kw = vec_kw.get_feature_names_out()
+            labels_kw = {}
+            for i in range(num_clusters_c):
+                center = kmeans_kw.cluster_centers_[i]
+                top_idx = center.argsort()[-4:][::-1]
+                labels_kw[i] = f"Keyword Cluster {i}: " + ", ".join([terms_kw[idx].replace("_", " ") for idx in top_idx])
+            working_df["Keyword Topic Label"] = working_df["cluster_kw"].map(labels_kw)
+            
+            fig_kw = px.scatter(working_df, x="x_kw", y="y_kw", color="Keyword Topic Label", hover_data=["Title"], template="plotly_white")
+            st.plotly_chart(fig_kw, use_container_width=True)
+            
+            # Standalone HTML export download features
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                buf1 = io.StringIO()
+                fig_text.write_html(buf1, full_html=True, include_plotlyjs='cdn')
+                st.download_button("💾 Download Map A HTML", data=buf1.getvalue(), file_name="abstract_map.html", mime="text/html")
+            with col_d2:
+                buf2 = io.StringIO()
+                fig_kw.write_html(buf2, full_html=True, include_plotlyjs='cdn')
+                st.download_button("💾 Download Map B HTML", data=buf2.getvalue(), file_name="keywords_map.html", mime="text/html")
+
+# ----------------------------------------------------
+# NEW INTERACTIVE WORKSPACE: KEYWORD COMMUNITY MESH
+# ----------------------------------------------------
+# ----------------------------------------------------
+# NEW INTERACTIVE WORKSPACE: KEYWORD COMMUNITY MESH (FIXED NAMING COLLISION)
+# ----------------------------------------------------
+with tab_mesh:
+    st.subheader("Keyword Association Mesh Network")
+    st.caption("Maps structural intersections of author terms. Ideal for identifying crossover fields or special issue scopes.")
+    
+    max_nodes_c = st.slider("Max Keywords in Network", 20, 100, 50, key="plugin_max_nodes")
+    
+    resolution_c = st.slider(
+        "Community resolution",
+        min_value=0.5,
+        max_value=2.5,
+        value=1.0,
+        step=0.1,
+        key="plugin_community_resolution",
+        help="Higher values produce more, smaller keyword communities; lower values produce fewer, broader communities."
+    )
+
+    # Safe internal import alias modification to protect against the 'go' button override
+    import plotly.graph_objects as pgo
+    
+    if df is not None and not df.empty:
+        working_df = df.copy()
+        all_keywords_lists = []
+        for idx, row in working_df.iterrows():
+            if "keywords" in working_df.columns and isinstance(row["keywords"], list):
+                all_keywords_lists.append([str(k).lower() for k in row["keywords"] if k])
+            elif "TopicsTopN" in working_df.columns and isinstance(row["TopicsTopN"], str):
+                all_keywords_lists.append([k.strip().lower() for k in row["TopicsTopN"].split(";") if k.strip()])
+        
+        flat_keywords = [kw for sublist in all_keywords_lists for kw in sublist]
+        kw_counts = Counter(flat_keywords)
+        top_kws_tuples = kw_counts.most_common(max_nodes_c)
+        
+        G = nx.Graph()
+        for kw, count in top_kws_tuples:
+            G.add_node(kw, size=count)
+            
+        for paper_kws in all_keywords_lists:
+            valid_kws = [k for k in paper_kws if k in G]
+            if len(valid_kws) > 1:
+                for u, v in itertools.combinations(valid_kws, 2):
+                    if G.has_edge(u, v): 
+                        G[u][v]['weight'] += 1
+                    else: 
+                        G.add_edge(u, v, weight=1)
+                        
+        edges_to_remove = [(u, v) for u, v, d in G.edges(data=True) if d['weight'] < 2]
+        G.remove_edges_from(edges_to_remove)
+        
+        if len(G.nodes) == 0:
+            st.info("💡 Not enough shared keywords co-occurrences found to populate network links.")
+        else:
+            #communities = nx.community.louvain_communities(G, seed=42)
+            communities = nx.community.louvain_communities(
+                G,
+                resolution=resolution_c,
+                seed=42
+            )
+            community_map = {}
+            for idx, community in enumerate(communities):
+                for node in community:
+                    community_map[node] = idx + 1
+                    
+            pos = nx.spring_layout(G, k=0.4, iterations=50, seed=42)
+            
+            edge_x, edge_y = [], []
+            for edge in G.edges():
+                x0, y0 = pos[edge[0]][0], pos[edge[0]][1]
+                x1, y1 = pos[edge[1]][0], pos[edge[1]][1]
+                edge_x.extend([x0, x1, None])
+                edge_y.extend([y0, y1, None])
+                
+            # Swapped go.Scatter -> pgo.Scatter
+            edge_trace = pgo.Scatter(x=edge_x, y=edge_y, line=dict(width=1, color='#cbd5e1'), hoverinfo='none', mode='lines')
+            
+            node_x, node_y, node_text, node_color, node_size = [], [], [], [], []
+            for node in G.nodes():
+                node_x.append(pos[node][0])
+                node_y.append(pos[node][1])
+                node_text.append(f"Keyword: {node}<br>Mentions: {G.nodes[node]['size']}")
+                node_color.append(community_map.get(node, 0))
+                node_size.append(np.log1p(G.nodes[node]['size']) * 12)
+                
+            # Swapped go.Scatter -> pgo.Scatter
+            node_trace = pgo.Scatter(
+                x=node_x, y=node_y, mode='markers+text', text=[n for n in G.nodes()], textposition="top center",
+                hoverinfo='text', hovertext=node_text,
+                marker=dict(
+                    size=node_size, color=node_color, colorscale='Spectral', line_width=1.5, showscale=True,
+                    colorbar=dict(title="Group ID", tickvals=list(set(node_color)))
+                )
+            )
+            
+            # Swapped go.Figure/go.Layout -> pgo.Figure/pgo.Layout
+            fig_network = pgo.Figure(data=[edge_trace, node_trace], layout=pgo.Layout(showlegend=False, hovermode='closest', xaxis=dict(showgrid=False, zeroline=False, showticklabels=False), yaxis=dict(showgrid=False, zeroline=False, showticklabels=False), template="plotly_white"))
+            st.plotly_chart(fig_network, use_container_width=True)
+            
+            buf_net = io.StringIO()
+            fig_network.write_html(buf_net, full_html=True, include_plotlyjs='cdn')
+            st.download_button("💾 Download Network Graph HTML", data=buf_net.getvalue(), file_name="network_graph.html", mime="text/html")
+
+
+
+with tab_chatgpt:
+    st.subheader("ChatGPT enrichment")
+
+    # Safety: do not allow ChatGPT calls while in Fetch-from-OpenAlex mode
+    if 'data_source' in globals() and data_source == "Fetch from OpenAlex":
+        st.warning(
+            "ChatGPT enrichment is disabled while 'Data source' is set to **Fetch from OpenAlex**. "
+            "Switch to **Upload CSV** or **Use loaded data** first (to avoid accidental large API spend)."
+        )
+        #st.stop()
+    else:
+        st.caption("Runs on the current loaded dataframe only (uploaded or previously fetched).")
+
+        # --- Controls ---
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            openai_api_key = st.text_input("OpenAI API key", value="", type="password")
+        with colB:
+            openai_model = st.text_input("Model", value="gpt-4o-mini")
+        with colC:
+            openai_temp = st.slider("Temperature", 0.0, 1.2, 0.8, 0.1)
+
+        preset = st.selectbox(
+            "Prompt preset",
+            ["Key challenge / Review", "(placeholder) Prompt 2", "(placeholder) Prompt 3", "Write your own"],
+            index=0,
+        )
+
+        PRESET_KEY_CHALLENGE = (
+            "Identify the key challenge in the following text and provide it without any line breaks, "
+            "then insert a line break and on a new line provide a title for a possible review article "
+            "addressing this challenge without any further line breaks.\n\n"
+            "{input_text}"
+        )
+
+        PRESET_2 = (
+            "Provide a one-sentence plain-language summary of the following text (single line, no line breaks).\n\n"
+            "{input_text}"
+        )
+
+        PRESET_3 = (
+            "Suggest three potential applications or implications (single line; separate items with '; ').\n\n"
+            "{input_text}"
+        )
+
+        if preset == "Key challenge / Review":
+            prompt_text = st.text_area("Prompt", value=PRESET_KEY_CHALLENGE, height=140)
+        elif preset == "(placeholder) Prompt 2":
+            prompt_text = st.text_area("Prompt", value=PRESET_2, height=140)
+        elif preset == "(placeholder) Prompt 3":
+            prompt_text = st.text_area("Prompt", value=PRESET_3, height=140)
+        else:
+            prompt_text = st.text_area("Prompt", value="", height=140, placeholder="Write your prompt here. Must include {input_text}.")
+
+        # What to send
+        input_mode = st.selectbox("Send to ChatGPT", ["Abstract", "Title", "Title + Abstract", "Custom column"], index=0)
+        custom_col = ""
+        if input_mode == "Custom column":
+            text_cols = [c for c in df.columns if c not in ("SPECTER2",) ]
+            custom_col = st.selectbox("Column", options=text_cols, index=0 if text_cols else 0)
+
+        top_n = st.number_input("Top N records (test)", min_value=1, max_value=500, value=10, step=1)
+
+        run = st.button("Run ChatGPT enrichment", type="primary")
+
+        if run:
+            if not openai_api_key.strip():
+                st.error("OpenAI API key is required.")
+            elif not prompt_text.strip() or "{input_text}" not in prompt_text:
+                st.error("Prompt must be non-empty and include the placeholder {input_text}.")
+            else:
+                prog = st.progress(0.0)
+                try:
+                    df2 = enrich_df_with_chatgpt(
+                        df=df,
+                        top_n=int(top_n),
+                        api_key=openai_api_key.strip(),
+                        model=openai_model.strip(),
+                        temperature=float(openai_temp),
+                        prompt_text=prompt_text,
+                        preset_name=preset if preset != "Write your own" else "Custom",
+                        input_mode=input_mode,
+                        custom_col=custom_col,
+                        progress_cb=prog.progress,
+                    )
+                    st.session_state.df = df2
+                    df = df2
+                    st.success(f"ChatGPT enrichment completed for Top {int(top_n)} rows.")
+                    ####
+                    st.download_button(
+                        label="⬇ Download enriched Top N (CSV)",
+                        data=df.head(int(top_n)).to_csv(index=False).encode("utf-8"),
+                        file_name=f"chatgpt_enriched_top{int(top_n)}.csv",
+                        mime="text/csv",
+                    )
+                    
+                    ####
+
+                    # --- Show results immediately in the UI ---
+                    st.markdown("### Preview of enriched rows (Top N)")
+
+                    if preset == "Key challenge / Review":
+                        show_cols = [
+                            c for c in [
+                                "DOI", "Title", "Article Title",
+                                "Key challenge identified by ChatGPT",
+                                "Possible Review Article Title suggested by ChatGPT"
+                            ]
+                            if c in df.columns
+                        ]
+                    else:
+                        out_col = f"ChatGPT output ({preset if preset != 'Write your own' else 'Custom'})"
+                        show_cols = [c for c in ["DOI", "Title", "Article Title", out_col] if c in df.columns]
+
+                    st.dataframe(df.head(int(top_n))[show_cols], use_container_width=True)
+                    ###
+                    with st.expander("Show input text used for the first enriched record"):
+                        st.write(build_input_text_from_row(df.iloc[0], mode=input_mode, custom_col=custom_col))
+                    ###
+
+                except Exception as e:
+                    st.error(f"ChatGPT enrichment failed: {e}")
+                finally:
+                    prog.empty()
+
+
+
+with tab_commissioning:
+    st.subheader("Commissioning: propose review topics from a selected group")
+    st.caption("Select a grouping column + values, then generate review-topic proposals supported by multiple papers.")
+
+    # Safety: do not allow model calls while fetching from OpenAlex
+    if 'data_source' in globals() and data_source == "Fetch from OpenAlex":
+        st.warning(
+            "Commissioning is disabled while 'Data source' is set to **Fetch from OpenAlex**. "
+            "Switch to **Upload CSV** or **Use loaded data** first (to avoid accidental large API spend)."
+        )
+        #st.stop()
+    else:
+        # --- Inputs ---
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            openai_api_key_c = st.text_input("OpenAI API key", value="", type="password", key="oa_key_comm")
+        with col2:
+            openai_model_c = st.text_input("Model", value="gpt-4o-mini", key="oa_model_comm")
+        with col3:
+            openai_temp_c = st.slider("Temperature", 0.0, 1.2, 0.3, 0.1, key="oa_temp_comm")
+
+        # Choose grouping/cluster column
+        candidate_cols = [c for c in df.columns if c not in ("Abstract", "SPECTER2")]
+        cluster_col = st.selectbox("Grouping / clustering column", options=candidate_cols, index=0, key="comm_cluster_col")
+
+        # Values from that column
+        vals = df[cluster_col].dropna().unique().tolist() if cluster_col in df.columns else []
+        # Sort for display (safe)
+        try:
+            vals = sorted(vals, key=lambda x: str(x))
+        except Exception:
+            vals = [str(x) for x in vals]
+
+        cluster_values = st.multiselect("Select value(s) to include", options=vals, default=vals[:1] if vals else [], key="comm_cluster_vals")
+
+        # What to send
+        input_mode = st.selectbox("Send to model", ["Title", "Abstract", "Title + Abstract", "Custom column"], index=2, key="comm_input_mode")
+        custom_col = ""
+        if input_mode == "Custom column":
+            custom_col = st.selectbox("Custom column", options=list(df.columns), index=0, key="comm_custom_col")
+
+        colA, colB, colC = st.columns([1, 1, 1])
+        with colA:
+            max_papers = st.number_input("Max papers to include (sample)", min_value=5, max_value=200, value=30, step=5, key="comm_max_papers")
+        with colB:
+            min_support = st.number_input("Min supporting papers per topic", min_value=2, max_value=10, value=2, step=1, key="comm_min_support")
+        with colC:
+            show_raw = st.checkbox("Show raw model output", value=False, key="comm_show_raw")
+
+        run_comm = st.button("Generate review topics", type="primary", key="comm_run")
+
+        if run_comm:
+            if not openai_api_key_c.strip():
+                st.error("OpenAI API key is required.")
+            elif not cluster_values:
+                st.error("Select at least one value in the grouping column.")
+            else:
+                prog = st.progress(0.0)
+                try:
+                    topics_df, support_df, raw = commissioning_run(
+                        df=df,
+                        cluster_col=cluster_col,
+                        cluster_values=cluster_values,
+                        max_papers=int(max_papers),
+                        input_mode=input_mode,
+                        custom_col=custom_col,
+                        min_support=int(min_support),
+                        api_key=openai_api_key_c.strip(),
+                        model=openai_model_c.strip(),
+                        temperature=float(openai_temp_c),
+                        progress_cb=prog.progress,
+                    )
+
+                    st.session_state["commissioning_topics_df"] = topics_df
+                    st.session_state["commissioning_support_df"] = support_df
+                    st.session_state["commissioning_raw"] = raw
+
+                    if topics_df is None or topics_df.empty:
+                        st.warning("No topics parsed from model output (or output wasn't valid JSON).")
+                    else:
+                        st.success(f"Generated {len(topics_df)} proposed review topics.")
+
+                except Exception as e:
+                    st.error(f"Commissioning run failed: {e}")
+                finally:
+                    prog.empty()
+
+        # Display latest results if present
+        topics_df = st.session_state.get("commissioning_topics_df")
+        support_df = st.session_state.get("commissioning_support_df")
+
+        if isinstance(topics_df, pd.DataFrame) and not topics_df.empty:
+            st.markdown("### Proposed review topics")
+            st.dataframe(topics_df, use_container_width=True)
+
+            st.download_button(
+                "⬇ Download review topics (CSV)",
+                data=topics_df.to_csv(index=False).encode("utf-8"),
+                file_name="commissioning_review_topics.csv",
+                mime="text/csv",
+            )
+
+        if isinstance(support_df, pd.DataFrame) and not support_df.empty:
+            st.markdown("### Topic → supporting papers")
+            st.dataframe(support_df, use_container_width=True)
+            st.download_button(
+                "⬇ Download topic-to-papers mapping (CSV)",
+                data=support_df.to_csv(index=False).encode("utf-8"),
+                file_name="commissioning_topic_to_papers.csv",
+                mime="text/csv",
+            )
+
+        if show_raw:
+            raw = st.session_state.get("commissioning_raw", "")
+            if raw:
+                st.markdown("### Raw model output")
+                st.code(raw)
+
+with tab_copilot:
+    st.subheader("Copilot Megaprompt Generator")
+    st.caption("Prepare dataset slice + megaprompt for Step 1 + Step 2 workflow in Copilot/Researcher.")
+
+    if df is None or df.empty:
+        st.info("No dataset loaded yet.")
+        st.stop()
+
+    # --- Column selection ---
+    all_cols = list(df.columns)
+
+    cluster_col = st.selectbox(
+        "Grouping / clustering column",
+        options=all_cols,
+        index=all_cols.index("PrimaryTopic") if "PrimaryTopic" in all_cols else 0
+    )
+
+    cluster_values = st.multiselect(
+        "Values to include",
+        options=sorted(df[cluster_col].dropna().unique())
+    )
+
+    # --- Parameters ---
+    max_papers = st.number_input(
+        "Max papers to include",
+        min_value=10,
+        max_value=5000,
+        value=200,
+        step=10
+    )
+
+    min_support = st.number_input(
+        "Min supporting papers per topic",
+        min_value=2,
+        max_value=10,
+        value=3,
+        step=1
+    )
+
+    temperature = st.slider(
+        "Temperature (passed to Copilot, informational)",
+        min_value=0.0,
+        max_value=1.5,
+        value=0.7,
+        step=0.1
+    )
+
+    # --- Generate ---
+    if st.button("Generate Copilot package"):
+
+        # --- Slice dataset ---
+        if cluster_values:
+            df_slice = df[df[cluster_col].isin(cluster_values)].copy()
+        else:
+            df_slice = df.copy()
+
+        df_slice = df_slice.head(max_papers)
+
+        if df_slice.empty:
+            st.warning("No rows after filtering.")
+            st.stop()
+
+        st.success(f"Sliced dataset: {len(df_slice)} papers")
+
+        # --- Download sliced dataset ---
+        st.download_button(
+            label="Download sliced dataset (CSV)",
+            data=df_slice.to_csv(index=False).encode("utf-8"),
+            file_name=f"copilot_input_{len(df_slice)}.csv",
+            mime="text/csv",
+        )
+
+        # --- Build megaprompt ---
+        megaprompt = f"""
+You are an expert scientific editor performing a TWO-STAGE commissioning workflow:
+
+STAGE 1 = OFFLINE TOPIC GENERATION (from dataset)
+STAGE 2 = ONLINE NOVELTY VALIDATION + AUTHOR IDENTIFICATION (using live web search)
+
+You MUST follow a TWO-STAGE workflow.
+
+STEP 1:
+- Perform full topic analysis
+- Generate structured output
+
+STOP AFTER STEP 1.
+Do NOT proceed to STEP 2 yet.
+
+Wait for the user to confirm continuation.
+
+STEP 2:
+- Will be executed only AFTER the user explicitly instructs you to proceed
+- At that point, you MUST use live web search
+
+========================================
+DATA SOURCE (CRITICAL)
+========================================
+
+You have access to an UPLOADED DATASET (CSV file) containing scientific articles.
+
+The dataset includes:
+- DOI
+- Title
+- Abstract
+
+IMPORTANT:
+- Use ONLY the uploaded dataset
+- Supporting articles MUST come ONLY from dataset
+- DOIs MUST match dataset entries
+
+========================================
+EXECUTION SEQUENCE
+========================================
+
+STEP 1 → Topic generation  
+STEP 2 → Novelty validation  
+
+========================================
+STEP 1 — TOPIC GENERATION (OFFLINE)
+========================================
+
+You operate WITHOUT web access.
+
+TASK:
+1) Identify recurring problems
+2) Cluster papers
+3) Propose review topics
+4) Create search strategies
+
+RULES:
+- Problem-centric, not tool-centric
+- Minimum {min_support} supporting papers
+- Avoid generic topics
+
+OUTPUT:
+6–12 topics with supporting DOIs
+
+========================================
+STEP 1 — STRUCTURED OUTPUT
+========================================
+
+Produce:
+
+STEP 2 INPUT (STRUCTURED):
+
+[
+  {{
+    "topic_label": "",
+    "description": "",
+    "search_queries": [],
+    "supporting_articles": [
+      {{
+        "short_title": "",
+        "doi_id": ""
+      }}
+    ]
+  }}
+]
+
+========================================
+STEP 2 — NOVELTY + AUTHOR IDENTIFICATION (ONLINE)
+
+IMPORTANT:
+You MUST NOT execute this step unless the user explicitly instructs you to proceed.
+========================================
+
+You now operate in ONLINE MODE and MUST use live web search.
+FAIL-SAFE: If web search is blocked → stop immediately and report limitation.
+
+-----------------------------------
+TASK
+-----------------------------------
+
+For EACH topic:
+
+1) Review overlap analysis  
+2) Recent primary research activity  
+3) Novelty assessment  
+4) Commissioning potential  
+5) IDENTIFY POTENTIAL AUTHORS AND THEIR EMAILS  
+
+
+-----------------------------------
+A) REVIEW OVERLAP ANALYSIS
+-----------------------------------
+
+Return:
+
+Review_overlap:
+- NONE / PARTIAL / STRONG
+
+Evidence:
+- 2–4 review articles (title + year)
+- Brief note on relevance
+
+
+-----------------------------------
+B) RECENT PRIMARY RESEARCH
+-----------------------------------
+
+Return:
+
+Recent_activity:
+- LOW / MEDIUM / HIGH
+
+Evidence:
+- 2–4 recent primary studies
+- Short interpretation
+
+
+-----------------------------------
+C) NOVELTY
+-----------------------------------
+
+Return:
+
+Novelty_assessment:
+- HIGH / MEDIUM / LOW
+
+
+-----------------------------------
+D) COMMISSIONING
+-----------------------------------
+
+Return:
+
+Commissioning_potential:
+- HIGH / MEDIUM / LOW
+
+Suggested_angle_refinement:
+(1–2 sentences)
+
+
+-----------------------------------
+E) POTENTIAL AUTHOR IDENTIFICATION (MANDATORY)
+-----------------------------------
+
+You MUST identify 2–4 suitable authors per topic.
+
+Selection rules:
+
+- Authors MUST be selected from the supporting_articles where possible
+- Additional authors may be identified via live web search
+- Prefer corresponding authors explicitly listed
+- If not available, select first or last authors
+- Prefer authors with multiple recent publications in the topic
+- Avoid listing multiple authors from the same paper unless necessary
+
+
+-----------------------------------
+VERIFIED EMAIL EXTRACTION (STRICT)
+-----------------------------------
+
+For EACH candidate author:
+
+You MUST retrieve at least one VERIFIED professional email from ONLY:
+
+(a) publisher article page  
+(b) full-text PDF  
+(c) official institutional website  
+
+STRICT RULES:
+
+- Do NOT guess or infer email addresses
+- Do NOT construct emails from name patterns
+- Do NOT reuse emails from unrelated contexts
+- If no verified email is found:
+
+    → Email = "?"  
+    → Provide brief reason  
+
+
+-----------------------------------
+OUTPUT FORMAT (EXTENDED)
+-----------------------------------
+
+For EACH topic, append:
+
+Suggested_authors:
+
+- Name:
+  Affiliation:
+  Email:
+  Email_confidence:
+    - HIGH (publisher or PDF verified)
+    - MEDIUM (institutional website)
+    - LOW (uncertain source)
+  Justification:
+
+
+-----------------------------------
+FINAL SUMMARY
+-----------------------------------
+
+After all topics:
+
+Provide:
+
+- Top commissioning opportunities  
+- Topics to avoid  
+- Key thematic patterns  
+
+-----------------------------------
+CRITICAL RULES
+-----------------------------------
+
+- You MUST perform author identification
+- You MUST attempt email retrieval for each author
+- You MUST follow verification rules strictly
+- Do NOT skip this section
+
+========================================
+
+User parameters:
+- Grouping column: {cluster_col}
+- Selected values: {cluster_values}
+- Number of papers: {len(df_slice)}
+- Temperature (info): {temperature}
+"""
+
+        # --- Show prompt ---
+        st.subheader("Megaprompt (copy to Copilot)")
+        st.text_area(
+            "Megaprompt",
+            value=megaprompt,
+            height=400
+        )
+
+
+with tab_download:
+    st.caption("DEBUG BUILD: fernet_journalsAccum_v3 — 2026-05-19 09:xx")
+    st.subheader("Download")
+    st.download_button(
+        label="Download CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=f"openalex_dataset_{len(df)}.csv",
+        mime="text/csv",
+    )
+
+#tab_lexical, tab_mesh = st.tabs(["📊 Topic Clustering", "🕸️ Community Mesh"])
