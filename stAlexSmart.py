@@ -1,12 +1,12 @@
+# adding network analysis, multi-subfield filtering, somewhat legacy but fast and memory-efficient pipeline for on the fly clustering (MiniBatchKMeans+TruncadedSVD) and keyword extraction
+
 # derived from stSearchDashOpenAlex_PinaColada_subfield_multiselect.py
 # which was stSearchDashOpenAlex_ouzo_enrichment_bubble.py complemented with the edits to handle field loading errors from the version edited directly in GitHub downloaded as sandbox4OpenAlex_github9Jul2026.py
 #In your master app's fetch_works function, the OpenAlex API query filter string is hardcoded to use primary_topic.subfield.id:
 #python
 #filters.append(f"primary_topic.subfield.id:{joined_subfields}")
-#Use code with caution.
 #OpenAlex only assigns a Primary Topic (and therefore a primary subfield) to works where their machine-learning classifier is exceptionally confident. If a 2026 paper is too new, hasn't accumulated citations, or has an abstract that is hard to categorize, OpenAlex leaves the primary_topic field completely blank.
 #Because your script enforces a strict primary_topic.subfield.id filter at the API level, it completely filters out any paper where that field is missing. For the Aging subfield in 2026, there are exactly 1,933 papers that have a fully resolved, indexed primary topic tag.
-
 
 
 ###continue with this verison; the next thing to do: sampling/randomization
