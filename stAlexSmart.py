@@ -1,19 +1,22 @@
+# y axis labels getting cut of when bubble chart exported
+
+
 # adding network analysis, multi-subfield filtering, somewhat legacy but fast and memory-efficient pipeline for on the fly clustering (MiniBatchKMeans+TruncadedSVD) and keyword extraction
 
 # derived from stSearchDashOpenAlex_PinaColada_subfield_multiselect.py
 # which was stSearchDashOpenAlex_ouzo_enrichment_bubble.py complemented with the edits to handle field loading errors from the version edited directly in GitHub downloaded as sandbox4OpenAlex_github9Jul2026.py
-#In your master app's fetch_works function, the OpenAlex API query filter string is hardcoded to use primary_topic.subfield.id:
+#In the master app's fetch_works function, the OpenAlex API query filter string is hardcoded to use primary_topic.subfield.id:
 #python
 #filters.append(f"primary_topic.subfield.id:{joined_subfields}")
 #OpenAlex only assigns a Primary Topic (and therefore a primary subfield) to works where their machine-learning classifier is exceptionally confident. If a 2026 paper is too new, hasn't accumulated citations, or has an abstract that is hard to categorize, OpenAlex leaves the primary_topic field completely blank.
-#Because your script enforces a strict primary_topic.subfield.id filter at the API level, it completely filters out any paper where that field is missing. For the Aging subfield in 2026, there are exactly 1,933 papers that have a fully resolved, indexed primary topic tag.
+#Because the script enforces a strict primary_topic.subfield.id filter at the API level, it completely filters out any paper where that field is missing. For the Aging subfield in 2026, there are exactly 1,933 papers that have a fully resolved, indexed primary topic tag.
 
 
 ###continue with this verison; the next thing to do: sampling/randomization
 
 # This _negroni is simply copied stSearchDashOpenAlex_martini_with_olive_deployed_Copilot.py
 # 
-# Ask copilot (>> "🤖🚧Adding COPILOT to OpenAlex app") for my todos and bookmarks and my genius idea (instead of target journal, v.v.)
+# Ask copilot (>> "🤖🚧Adding COPILOT to OpenAlex app") to dig out my todos and bookmarks and my genius idea (instead of target journal, v.v.)
 ## also yaml --> dynamic prompt
 
 ## I need to "explode" the 3 topics and add a possibility to commission based on them
@@ -1374,22 +1377,23 @@ st.title("Lucie's Enriched Alex Concoction ⚗️")
 #    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles. "
 #)
 
-st.warning(
-"🚦 **Usage note:** Each page (page = up to 200 rows) of OpenAlex results consumes API credits. Large queries and repeated searches can quickly use up the shared daily quota (for this app, no matter who uses it).\n\n"
-"👉 Start small (500–2,000 records) and increase only if needed."
-"👉 Export results and reuse via Upload CSV to avoid repeated API calls."
-"👉 For regular or heavy use, please get your own free OpenAlex API key."
-)
+with st.expander("Warnings and known bugs:"):
+     st.warning(
+     "🚦 **Usage note:** Each page (page = up to 200 rows) of OpenAlex results consumes API credits. Large queries and repeated searches can quickly use up the shared daily quota (for this app, no matter who uses it).\n\n"
+     "👉 Start small (500–2,000 records) and increase only if needed."
+     "👉 Export results and reuse via Upload CSV to avoid repeated API calls."
+     "👉 For regular or heavy use, please get your own free OpenAlex API key."
+     )
 
 st.info(
 "ℹ️ Credit usage depends on how many requests (“pages”) are needed. "
 "Since each page returns up to ~200 results, larger result sets require more pages and consume more credits." )
 
-
-st.warning(
-    "⚠️I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
-    "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles.⚠️ "
-)
+with st.expander("Warnings and known bugs:"):
+     st.warning(
+         "⚠️I am still trying to understand why these results sometimes DRAMATICALLY differer in count from results from the OpenAlex web interface/other bibliographic databases."
+         "One known issue is that OpenAlex sometimes classifies Meeting Abstracts as articles.⚠️ "
+     )
 
 with st.sidebar:
     st.header("Inputs")
